@@ -1,0 +1,22 @@
+{
+  "name": "sih-26189-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.57.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "react-force-graph": "^1.47.4",
+    "react-force-graph-2d": "^1.29.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^5.0.2",
+    "vite": "^7.1.3"
+  }
+}

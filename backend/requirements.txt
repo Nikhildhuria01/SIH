@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+supabase
+pydantic
+python-multipart
+spacy
+scikit-learn
+pandas
+numpy
+joblib
+networkx
+langdetect
