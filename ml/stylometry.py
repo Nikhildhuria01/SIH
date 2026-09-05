@@ -1,16 +1,37 @@
-"""Stylometry baseline: predicts author/class from writing style, not identity certainty.
-Train only on legally obtained, properly authorized text. Synthetic demo data can be used for SIH.
+"""Stylometry baseline for authorized investigative comparison.
+
+Stylometry is probabilistic. It should be presented as a supporting signal, not
+as definitive authorship or identity proof.
 """
-import pandas as pd, joblib, os
-from sklearn.pipeline import Pipeline
+from pathlib import Path
+import joblib
+import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
 
-df=pd.read_csv('stylometry_demo.csv')
-Xtr,Xte,ytr,yte=train_test_split(df.text,df.author,test_size=.25,random_state=42,stratify=df.author)
-model=Pipeline([('tfidf',TfidfVectorizer(analyzer='char',ngram_range=(3,5),min_df=1,max_features=20000)),('clf',LogisticRegression(max_iter=2000))])
-model.fit(Xtr,ytr)
-print(classification_report(yte,model.predict(Xte)))
-os.makedirs('models',exist_ok=True);joblib.dump(model,'models/stylometry.joblib')
+ROOT = Path(__file__).resolve().parent
+CSV = ROOT / "stylometry_demo.csv"
+MODEL = ROOT / "stylometry.joblib"
+
+df = pd.read_csv(CSV)
+X_train, X_test, y_train, y_test = train_test_split(
+    df.text,
+    df.author,
+    test_size=0.25,
+    random_state=42,
+    stratify=df.author,
+)
+
+model = Pipeline(
+    [
+        ("tfidf", TfidfVectorizer(analyzer="char", ngram_range=(3, 5), max_features=30000)),
+        ("clf", LogisticRegression(max_iter=3000)),
+    ]
+)
+model.fit(X_train, y_train)
+print(classification_report(y_test, model.predict(X_test)))
+joblib.dump(model, MODEL)
+print("Saved", MODEL)

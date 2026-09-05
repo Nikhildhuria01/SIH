@@ -1,22 +1,74 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "./lib/supabase";
 import ForceGraph2D from "react-force-graph-2d";
 
-const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
+const API = import.meta.env.VITE_API_URL || "http://localhost:8080";
+
+const SOURCE_TYPES = [
+  { key: "FIR", label: "FIR / Police Complaint", icon: "📄", hint: "FIR narratives, complaint text, witness statements" },
+  { key: "POLICE_REPORT", label: "Police Reports", icon: "🛡️", hint: "Case notes, investigation reports, seizure or interrogation records" },
+  { key: "CDR", label: "Call Detail Records", icon: "☎", hint: "Call frequency, duration, timestamps and communication patterns" },
+  { key: "FINANCIAL", label: "Financial Transactions", icon: "₹", hint: "Transaction records, account activity, payment observations" },
+  { key: "SURVEILLANCE", label: "Surveillance Reports", icon: "📡", hint: "Observation logs, meetings, vehicle movement, locations" },
+  { key: "SOCIAL_MEDIA", label: "Social Media Intelligence", icon: "◉", hint: "Posts, handles, mentions, messages, public interactions" },
+  { key: "CRIMINAL_HISTORY", label: "Criminal History Database", icon: "⚖", hint: "Prior case references, charges, convictions or aliases" },
+];
+
+const EMPTY_SOURCE = SOURCE_TYPES.reduce((acc, source) => {
+  acc[source.key] = "";
+  return acc;
+}, {});
+
+function initials(name = "Unknown") {
+  return name
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((part) => part[0]?.toUpperCase())
+    .join("") || "U";
+}
+
+function escapeHtml(value = "") {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+async function apiFetch(path, options = {}, session) {
+  const response = await fetch(`${API}${path}`, {
+    ...options,
+    headers: {
+      Accept: "application/json",
+      ...(options.body ? { "Content-Type": "application/json" } : {}),
+      ...(session?.access_token
+        ? { Authorization: `Bearer ${session.access_token}` }
+        : {}),
+      ...(options.headers || {}),
+    },
+  });
+
+  const text = await response.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = { detail: text };
+  }
+
+  if (!response.ok) {
+    throw new Error(data?.detail || `Request failed with HTTP ${response.status}`);
+  }
+  return data;
+}
 
 export default function App() {
-  // =========================
-  // AUTH / USER STATE
-  // =========================
-
   const [session, setSession] = useState(null);
   const [profile, setProfile] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-
-  // =========================
-  // LOGIN STATE
-  // =========================
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -24,191 +76,76 @@ export default function App() {
   const [isSignup, setIsSignup] = useState(false);
   const [authLoading, setAuthLoading] = useState(false);
 
-  // =========================
-  // INVESTIGATION STATE
-  // =========================
-
   const [investigations, setInvestigations] = useState([]);
   const [selected, setSelected] = useState(null);
+  const [investigationFilter, setInvestigationFilter] = useState("active");
 
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [newTitle, setNewTitle] = useState("");
   const [newDescription, setNewDescription] = useState("");
+  const [newSources, setNewSources] = useState({ ...EMPTY_SOURCE });
+  const [newFirLanguage, setNewFirLanguage] = useState("en");
   const [creating, setCreating] = useState(false);
 
-  // =========================
-  // FIR / NLP STATE
-  // =========================
+  const [sourceDrafts, setSourceDrafts] = useState({ ...EMPTY_SOURCE });
+  const [sourceLanguage, setSourceLanguage] = useState("en");
+  const [analysisLoading, setAnalysisLoading] = useState(false);
+  const [analysis, setAnalysis] = useState(null);
 
   const [firText, setFirText] = useState("");
   const [firEntities, setFirEntities] = useState([]);
   const [firAnalyzing, setFirAnalyzing] = useState(false);
-
-  // =========================
-  // TIP / NETWORK STATE
-  // =========================
-
   const [tipText, setTipText] = useState("");
   const [tipResult, setTipResult] = useState(null);
   const [tipAnalyzing, setTipAnalyzing] = useState(false);
-
-  const [graph, setGraph] = useState({
-    nodes: [],
-    links: [],
-  });
-
-  const [graphLoading, setGraphLoading] = useState(false);
-  const graphRef = useRef(null);
-  const [selectedRelationship, setSelectedRelationship] = useState(null);
-const [peopleMap, setPeopleMap] = useState({});
-
-  // =========================
-  // CRIMINAL NETWORK SEARCH
-  // =========================
 
   const [criminalSearch, setCriminalSearch] = useState("");
   const [criminalResults, setCriminalResults] = useState([]);
   const [searchLoading, setSearchLoading] = useState(false);
   const [showSearchResults, setShowSearchResults] = useState(false);
   const [selectedCriminal, setSelectedCriminal] = useState(null);
-  const [hoveredNode, setHoveredNode] = useState(null);
-
-  // Keep the network spacious without pinning nodes.
-  // Nodes start in a radial layout, then D3 is free to move them.
-  useEffect(() => {
-    const fg = graphRef.current;
-    if (!fg || !graph.nodes.length) return;
-
-    const charge = fg.d3Force("charge");
-    if (charge) {
-      charge.strength(-1400).distanceMax(1400);
-    }
-
-    const link = fg.d3Force("link");
-    if (link) {
-      link.distance(300).strength(0.45);
-    }
-
-    const center = fg.d3Force("center");
-    if (center) {
-      center.strength(0.035);
-    }
-
-    // Extra collision force implemented locally so we don't need another package.
-    const collideForce = () => {
-      const nodes = graph.nodes;
-      const padding = 78;
-      for (let i = 0; i < nodes.length; i += 1) {
-        for (let j = i + 1; j < nodes.length; j += 1) {
-          const a = nodes[i];
-          const b = nodes[j];
-          if (typeof a.x !== "number" || typeof b.x !== "number") continue;
-          const dx = b.x - a.x;
-          const dy = b.y - a.y;
-          const distance = Math.sqrt(dx * dx + dy * dy) || 0.01;
-          const minimum = (a.is_center ? 55 : 42) + (b.is_center ? 55 : 42) + padding;
-          if (distance < minimum) {
-            const push = (minimum - distance) / distance * 0.5;
-            const px = dx * push;
-            const py = dy * push;
-            a.vx -= px;
-            a.vy -= py;
-            b.vx += px;
-            b.vy += py;
-          }
-        }
-      }
-    };
-    collideForce.initialize = () => {};
-    fg.d3Force("collision", collideForce);
-
-    fg.d3ReheatSimulation();
-
-    const timer = setTimeout(() => {
-      if (graphRef.current) {
-        graphRef.current.zoomToFit(700, 95);
-      }
-    }, 900);
-
-    return () => clearTimeout(timer);
-  }, [graph]);
-
-  // ============================================================
-  // INITIAL SESSION
-  // ============================================================
+  const [analysisGraph, setAnalysisGraph] = useState({ nodes: [], links: [] });
+  const [graph, setGraph] = useState({ nodes: [], links: [] });
+  const [graphLoading, setGraphLoading] = useState(false);
+  const [selectedRelationship, setSelectedRelationship] = useState(null);
+  const graphRef = useRef(null);
 
   useEffect(() => {
     let mounted = true;
 
-    async function initialize() {
+    const initialize = async () => {
       try {
         setLoading(true);
-        setError("");
-
         const {
-          data: { session },
-          error: sessionError,
+          data: { session: currentSession },
         } = await supabase.auth.getSession();
-
-        if (sessionError) {
-          throw sessionError;
-        }
-
         if (!mounted) return;
-
-        setSession(session);
-
-        if (session) {
-          await loadProfile(session.user.id);
-        }
+        setSession(currentSession);
+        if (currentSession) await loadProfile(currentSession.user.id);
       } catch (err) {
-        console.error("Initialization error:", err);
-        if (mounted) {
-          setError(err.message || "Unable to initialize application.");
-        }
+        if (mounted) setError(err.message || "Unable to initialize application.");
       } finally {
-        if (mounted) {
-          setLoading(false);
-        }
+        if (mounted) setLoading(false);
       }
-    }
+    };
 
     initialize();
 
-    // ============================================================
-    // AUTH STATE LISTENER
-    // ============================================================
-
     const {
       data: { subscription },
-    } = supabase.auth.onAuthStateChange((_event, newSession) => {
-      setSession(newSession);
-
-      // Important:
-      // Clear old user information before loading the new user's profile.
+    } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      setSession(nextSession);
       setProfile(null);
       setInvestigations([]);
       setSelected(null);
-      setGraph({
-        nodes: [],
-        links: [],
-      });
-      setSelectedRelationship(null);
-      setPeopleMap({});
-      setCriminalSearch("");
-      setCriminalResults([]);
-      setShowSearchResults(false);
+      setAnalysis(null);
+      setAnalysisGraph({ nodes: [], links: [] });
+      setGraph({ nodes: [], links: [] });
       setSelectedCriminal(null);
-      setHoveredNode(null);
-
-      if (!newSession) {
-        return;
+      setCriminalSearch("");
+      if (nextSession) {
+        setTimeout(() => loadProfile(nextSession.user.id), 0);
       }
-
-      // Avoid Supabase auth callback deadlocks.
-      setTimeout(() => {
-        loadProfile(newSession.user.id);
-      }, 0);
     });
 
     return () => {
@@ -217,1803 +154,813 @@ const [peopleMap, setPeopleMap] = useState({});
     };
   }, []);
 
-  // ============================================================
-  // LOAD PROFILE
-  // ============================================================
-
   async function loadProfile(userId) {
     try {
-      setError("");
-
-      const { data, error } = await supabase
+      const { data, error: profileError } = await supabase
         .from("profiles")
         .select("*")
         .eq("id", userId)
         .maybeSingle();
-
-      if (error) {
-        throw error;
-      }
-
+      if (profileError) throw profileError;
       setProfile(data);
-
-      if (data?.is_authorized === true) {
-        await loadInvestigations();
-      }
+      if (data?.is_authorized) await loadInvestigations();
     } catch (err) {
-      console.error("Profile error:", err);
       setError(err.message || "Unable to load profile.");
     }
   }
 
-  // ============================================================
-  // LOAD INVESTIGATIONS
-  // ============================================================
-
   async function loadInvestigations() {
-    try {
-      const { data, error } = await supabase
-        .from("investigations")
-        .select("*")
-        .order("created_at", {
-          ascending: false,
-        });
-
-      if (error) {
-        throw error;
-      }
-
-      setInvestigations(data || []);
-
-      if (data && data.length > 0 && !selected) {
-        setSelected(data[0]);
-      }
-    } catch (err) {
-      console.error("Investigation loading error:", err);
-      setError(err.message || "Unable to load investigations.");
-    }
+    const { data, error: investigationsError } = await supabase
+      .from("investigations")
+      .select("*")
+      .order("created_at", { ascending: false });
+    if (investigationsError) throw investigationsError;
+    setInvestigations(data || []);
+    if (data?.length && !selected) setSelected(data[0]);
   }
-
-  // ============================================================
-  // LOGIN / SIGNUP
-  // ============================================================
 
   async function handleAuth(event) {
     event.preventDefault();
-
+    setError("");
     if (!email.trim() || !password.trim()) {
       setError("Email and password are required.");
       return;
     }
-
     setAuthLoading(true);
-    setError("");
-
     try {
       if (isSignup) {
-        // -------------------------
-        // SIGN UP
-        // -------------------------
-
-        const {
-          data,
-          error,
-        } = await supabase.auth.signUp({
+        const { data, error: signUpError } = await supabase.auth.signUp({
           email: email.trim(),
           password,
-          options: {
-            data: {
-              full_name: fullName.trim(),
-            },
-          },
+          options: { data: { full_name: fullName.trim() } },
         });
-
-        if (error) {
-          throw error;
-        }
-
+        if (signUpError) throw signUpError;
         if (data.user && !data.session) {
-          alert(
-            "Account created successfully. Please verify your email if email confirmation is enabled."
-          );
+          alert("Account created. Verify your email if confirmation is enabled.");
         }
       } else {
-        // -------------------------
-        // LOGIN
-        // -------------------------
-
-        const {
-          data,
-          error,
-        } = await supabase.auth.signInWithPassword({
+        const { data, error: signInError } = await supabase.auth.signInWithPassword({
           email: email.trim(),
           password,
         });
-
-        if (error) {
-          throw error;
-        }
-
+        if (signInError) throw signInError;
         if (data.session) {
           setSession(data.session);
           await loadProfile(data.session.user.id);
         }
       }
     } catch (err) {
-      console.error("Authentication error:", err);
       setError(err.message || "Authentication failed.");
     } finally {
       setAuthLoading(false);
     }
   }
 
-  // ============================================================
-  // CREATE INVESTIGATION
-  // ============================================================
+  function resetCaseState() {
+    setAnalysis(null);
+    setFirText("");
+    setFirEntities([]);
+    setTipText("");
+    setTipResult(null);
+    setCriminalSearch("");
+    setCriminalResults([]);
+    setShowSearchResults(false);
+    setSelectedCriminal(null);
+    setSelectedRelationship(null);
+    setAnalysisGraph({ nodes: [], links: [] });
+    setGraph({ nodes: [], links: [] });
+    setSourceDrafts({ ...EMPTY_SOURCE });
+  }
 
-  async function createInvestigation() {
+  async function createInvestigation(event) {
+    event.preventDefault();
+    setError("");
     if (!newTitle.trim()) {
       setError("Investigation title is required.");
       return;
     }
-
-    if (!session?.user?.id) {
-      setError("You must be logged in.");
+    const filledSources = SOURCE_TYPES.filter((source) => newSources[source.key]?.trim());
+    if (filledSources.length === 0) {
+      setError("Add at least one intelligence source before starting the investigation.");
       return;
     }
 
     setCreating(true);
-    setError("");
-
     try {
-      const { data, error } = await supabase
-        .from("investigations")
-        .insert({
-          title: newTitle.trim(),
-          description: newDescription.trim(),
-          created_by: session.user.id,
-          status: "active",
-        })
-        .select("*")
-        .single();
+      const created = await apiFetch(
+        "/api/investigations",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            title: newTitle.trim(),
+            description: newDescription.trim(),
+          }),
+        },
+        session
+      );
 
-      if (error) {
-        throw error;
-      }
-
-      // Add newly created investigation to UI.
-      setInvestigations((previous) => [data, ...previous]);
-
-      // Automatically select it.
-      setSelected(data);
-
-      // Reset modal.
+      setInvestigations((prev) => [created, ...prev]);
+      setSelected(created);
+      setShowCreateModal(false);
       setNewTitle("");
       setNewDescription("");
-      setShowCreateModal(false);
+      setNewSources({ ...EMPTY_SOURCE });
+      resetCaseState();
 
-      alert(
-        `Investigation created successfully.\n\nInvestigation ID: ${data.investigation_code}`
+      const sources = filledSources.map((source) => ({
+        source_type: source.key,
+        title: source.label,
+        content: newSources[source.key],
+        language: source.key === "FIR" ? newFirLanguage : "en",
+      }));
+
+      const result = await apiFetch(
+        `/api/investigations/${created.id}/analyze-sources`,
+        { method: "POST", body: JSON.stringify({ sources }) },
+        session
       );
+      setAnalysis(result);
+      setAnalysisGraph(result.graph || { nodes: [], links: [] });
+      setGraph(result.graph || { nodes: [], links: [] });
+      await loadInvestigations();
     } catch (err) {
-      console.error("Create investigation error:", err);
-      setError(err.message || "Unable to create investigation.");
+      setError(err.message || "Unable to start investigation.");
     } finally {
       setCreating(false);
     }
   }
 
-  // ============================================================
-  // FIR NLP ANALYSIS
-  // ============================================================
+  async function analyzeSourcesForExistingCase() {
+    if (!selected) return;
+    const filled = SOURCE_TYPES.filter((source) => sourceDrafts[source.key]?.trim());
+    if (filled.length === 0) {
+      setError("Add at least one source before running analysis.");
+      return;
+    }
+    setAnalysisLoading(true);
+    setError("");
+    try {
+      const sources = filled.map((source) => ({
+        source_type: source.key,
+        title: source.label,
+        content: sourceDrafts[source.key],
+        language: source.key === "FIR" ? sourceLanguage : "en",
+      }));
+      const result = await apiFetch(
+        `/api/investigations/${selected.id}/analyze-sources`,
+        { method: "POST", body: JSON.stringify({ sources }) },
+        session
+      );
+      setAnalysis(result);
+      setAnalysisGraph(result.graph || { nodes: [], links: [] });
+      setGraph(result.graph || { nodes: [], links: [] });
+      setSourceDrafts({ ...EMPTY_SOURCE });
+      await loadInvestigations();
+    } catch (err) {
+      setError(err.message || "Source analysis failed.");
+    } finally {
+      setAnalysisLoading(false);
+    }
+  }
 
   async function analyzeFIR() {
-  if (!selected) {
-    setError("Please select an investigation first.");
-    return;
-  }
-
-  if (!firText.trim()) {
-    setError("Please enter FIR/report text first.");
-    return;
-  }
-
-  setFirAnalyzing(true);
-  setFirEntities([]);
-  setError("");
-
-  try {
-    const response = await fetch(`${API}/api/nlp/extract`, {
-      method: "POST",
-      headers: {
-  "Content-Type": "application/json",
-  Authorization: `Bearer ${session.access_token}`,
-},
-      body: JSON.stringify({
-        investigation_id: selected.id,
-        source_type: "FIR",
-        title: "FIR Analysis",
-        content: firText,
-      }),
-    });
-
-    const rawText = await response.text();
-
-    let data;
-
+    if (!selected || !firText.trim()) {
+      setError("Select an investigation and enter FIR text.");
+      return;
+    }
+    setFirAnalyzing(true);
+    setError("");
     try {
-      data = JSON.parse(rawText);
-    } catch {
-      data = {
-        detail: rawText,
-      };
-    }
-
-    console.log("NLP status:", response.status);
-    console.log("NLP response:", data);
-
-    if (!response.ok) {
-      let message =
-        data.detail ||
-        data.message ||
-        "FIR analysis failed.";
-
-      if (typeof message !== "string") {
-        message = JSON.stringify(message, null, 2);
-      }
-
-      throw new Error(message);
-    }
-
-    const entities = [];
-
-if (data.entities) {
-  Object.entries(data.entities).forEach(([label, values]) => {
-    if (Array.isArray(values)) {
-      values.forEach((value) => {
-        entities.push({
-          label,
-          text: value,
-        });
+      const data = await apiFetch(
+        "/api/nlp/extract",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            investigation_id: selected.id,
+            source_type: "FIR",
+            title: "Standalone FIR Analysis",
+            content: firText,
+            language: sourceLanguage,
+          }),
+        },
+        session
+      );
+      const entities = [];
+      Object.entries(data.entities || {}).forEach(([label, values]) => {
+        if (Array.isArray(values)) values.forEach((value) => entities.push({ label, text: value }));
       });
+      setFirEntities(entities);
+    } catch (err) {
+      setError(err.message || "FIR analysis failed.");
+    } finally {
+      setFirAnalyzing(false);
     }
-  });
-}
-
-setFirEntities(entities);
-  } catch (err) {
-    console.error("FIR analysis error:", err);
-
-    setError(
-      err instanceof Error
-        ? err.message
-        : JSON.stringify(err, null, 2)
-    );
-  } finally {
-    setFirAnalyzing(false);
   }
-}
-  // ============================================================
-  // TIP ANALYSIS
-  // ============================================================
 
   async function analyzeTip() {
-    if (!selected) {
-      setError("Please select an investigation first.");
+    if (!selected || !tipText.trim()) {
+      setError("Select an investigation and enter a tip.");
       return;
     }
-
-    if (!tipText.trim()) {
-      setError("Please enter a tip.");
-      return;
-    }
-
     setTipAnalyzing(true);
-    setTipResult(null);
     setError("");
-
     try {
-      const response = await fetch(`${API}/api/tips/analyze`, {
-        method: "POST",
-       headers: {
-  "Content-Type": "application/json",
-  Authorization: `Bearer ${session.access_token}`,
-},
-        body: JSON.stringify({
-          investigation_id: selected.id,
-          text: tipText,
-        }),
-      });
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(
-          data.detail || "Tip analysis failed."
-        );
-      }
-
-      setTipResult(data);
-    } catch (err) {
-      console.error("Tip analysis error:", err);
-      setError(
-        err.message ||
-          "Unable to analyze tip."
+      const result = await apiFetch(
+        "/api/tips/analyze",
+        { method: "POST", body: JSON.stringify({ investigation_id: selected.id, text: tipText }) },
+        session
       );
+      setTipResult(result);
+    } catch (err) {
+      setError(err.message || "Tip analysis failed.");
     } finally {
       setTipAnalyzing(false);
     }
   }
 
-  // ============================================================
-  // CRIMINAL SEARCH
-  // ============================================================
+  // Search within the graph generated for THIS investigation.
+  // No training dataset or global person database is queried here.
+  useEffect(() => {
+    const query = criminalSearch.trim().toLowerCase();
 
-  async function searchCriminals(query) {
-    if (!selected || !session?.access_token) return;
-
-    const value = query.trim();
-
-    if (!value) {
+    if (!query) {
       setCriminalResults([]);
       setShowSearchResults(false);
-      return;
+      return undefined;
     }
 
-    setSearchLoading(true);
+    const matches = (analysisGraph.nodes || [])
+      .filter((person) => {
+        const haystack = [
+          person.name,
+          person.id,
+          person.phone_num,
+          person.vehicle_num,
+          person.org,
+          person.location,
+        ]
+          .filter(Boolean)
+          .join(' ')
+          .toLowerCase();
+        return haystack.includes(query);
+      })
+      .slice(0, 10);
 
-    try {
-      const response = await fetch(
-        `${API}/api/investigations/${selected.id}/persons/search?q=${encodeURIComponent(value)}`,
-        {
-          headers: {
-            Authorization: `Bearer ${session.access_token}`,
-          },
-        }
-      );
+    setCriminalResults(matches);
+    setShowSearchResults(true);
+    setSearchLoading(false);
 
-      const data = await response.json();
+    return undefined;
+  }, [criminalSearch, analysisGraph]);
 
-      if (!response.ok) {
-        throw new Error(data.detail || "Unable to search persons.");
-      }
-
-      setCriminalResults(data || []);
-      setShowSearchResults(true);
-    } catch (err) {
-      console.error("Criminal search error:", err);
-      setError(err.message || "Unable to search persons.");
-    } finally {
-      setSearchLoading(false);
-    }
-  }
-
-  async function loadCriminalNetwork(person) {
-    if (!selected || !session?.access_token || !person) return;
+  function selectCriminal(person) {
+    if (!person) return;
 
     setSelectedCriminal(person);
-    setCriminalSearch(person.name || "");
+    setCriminalSearch(person.name || '');
     setCriminalResults([]);
     setShowSearchResults(false);
     setSelectedRelationship(null);
-    setGraphLoading(true);
-    setError("");
 
-    try {
-      const response = await fetch(
-        `${API}/api/investigations/${selected.id}/network/${encodeURIComponent(person.person_id)}`,
-        {
-          headers: {
-            Authorization: `Bearer ${session.access_token}`,
-          },
-        }
-      );
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.detail || "Unable to load criminal network.");
+    const relatedIds = new Set([person.id]);
+    const relatedLinks = (analysisGraph.links || []).filter((link) => {
+      const sourceId = typeof link.source === 'object' ? link.source.id : link.source;
+      const targetId = typeof link.target === 'object' ? link.target.id : link.target;
+      const connected = sourceId === person.id || targetId === person.id;
+      if (connected) {
+        relatedIds.add(sourceId);
+        relatedIds.add(targetId);
       }
-
-      const map = {};
-      (data.nodes || []).forEach((node) => {
-        map[node.id] = node.name;
-      });
-
-      setPeopleMap(map);
-      // Seed the graph with a centered subject and evenly spaced
-      // surrounding nodes. The force simulation will refine these
-      // positions while keeping the network readable.
-      const rawNodes = data.nodes || [];
-      const centerNode = rawNodes.find(
-        (node) => node.id === person.person_id
-      );
-      const connectedNodes = rawNodes.filter(
-        (node) => node.id !== person.person_id
-      );
-
-      const seededNodes = rawNodes.map((node) => {
-        if (node.id === person.person_id) {
-          return { ...node, x: 0, y: 0 };
-        }
-
-        const index = connectedNodes.findIndex(
-          (item) => item.id === node.id
-        );
-        const count = Math.max(connectedNodes.length, 1);
-        const angle = (index / count) * Math.PI * 2 - Math.PI / 2;
-        const radius = connectedNodes.length <= 8 ? 300 : 340;
-
-        return {
-          ...node,
-          x: Math.cos(angle) * radius,
-          y: Math.sin(angle) * radius,
-        };
-      });
-
-      setGraph({
-        nodes: seededNodes,
-        links: data.links || [],
-      });
-
-      // Use the complete person record returned by the network endpoint
-      // when it is available.
-      const center = (data.nodes || []).find(
-        (node) => node.id === person.person_id
-      );
-
-      if (center) {
-        setSelectedCriminal({
-          ...person,
-          ...center,
-        });
-      }
-    } catch (err) {
-      console.error("Criminal network loading error:", err);
-      setError(err.message || "Unable to load criminal network.");
-    } finally {
-      setGraphLoading(false);
-    }
-  }
-
-  function clearCriminalSearch() {
-    setCriminalSearch("");
-    setCriminalResults([]);
-    setShowSearchResults(false);
-    setSelectedCriminal(null);
-    setSelectedRelationship(null);
-    setHoveredNode(null);
-    setGraph({ nodes: [], links: [] });
-  }
-
-  // ============================================================
-  // LOAD NETWORK GRAPH
-  // ============================================================
-
-  async function loadGraph() {
-  if (!selected) {
-    setError("Please select an investigation first.");
-    return;
-  }
-
-  setGraphLoading(true);
-  setError("");
-
-  try {
-    const response = await fetch(
-      `${API}/api/investigations/${selected.id}/graph`,
-      {
-        headers: {
-          Authorization: `Bearer ${session.access_token}`,
-        },
-      }
-    );
-
-    const data = await response.json();
-
-    if (!response.ok) {
-      throw new Error(
-        data.detail || "Unable to load network graph."
-      );
-    }
-
-    // Create ID → name lookup
-    const map = {};
-
-    (data.nodes || []).forEach((person) => {
-      map[person.id] = person.name;
-    });
-
-    setPeopleMap(map);
-
-    // Give every connected person a clearly separated starting position.
-    // These are NOT fixed positions; D3 can move them after the simulation starts.
-    const rawNodes = data.nodes || [];
-    const centerNode = rawNodes.find((node) => node.is_center) || rawNodes[0];
-    const connectedNodes = rawNodes.filter((node) => node.id !== centerNode?.id);
-    const radius = Math.max(260, Math.min(430, 220 + connectedNodes.length * 24));
-
-    const arrangedNodes = rawNodes.map((node) => {
-      if (node.id === centerNode?.id) {
-        return { ...node, x: 0, y: 0 };
-      }
-
-      const index = connectedNodes.findIndex((item) => item.id === node.id);
-      const angle = (index / Math.max(connectedNodes.length, 1)) * Math.PI * 2 - Math.PI / 2;
-
-      return {
-        ...node,
-        x: Math.cos(angle) * radius,
-        y: Math.sin(angle) * radius,
-      };
+      return connected;
     });
 
     setGraph({
-      nodes: arrangedNodes,
-      links: data.links || [],
+      nodes: (analysisGraph.nodes || []).filter((node) => relatedIds.has(node.id)),
+      links: relatedLinks,
     });
-
-    // Clear previously selected relationship
-    setSelectedRelationship(null);
-
-  } catch (err) {
-    console.error("Graph loading error:", err);
-
-    setError(
-      err.message ||
-        "Unable to load network graph."
-    );
-  } finally {
-    setGraphLoading(false);
   }
-}
 
-  // ============================================================
-  // LOGOUT
-  // ============================================================
+  function resetGraphView() {
+    setSelectedCriminal(null);
+    setSelectedRelationship(null);
+    setGraph(analysisGraph || { nodes: [], links: [] });
+    setCriminalSearch('');
+    setCriminalResults([]);
+    setShowSearchResults(false);
+  }
+
+  useEffect(() => {
+    if (!selected || !session?.access_token) return;
+
+    let cancelled = false;
+
+    async function loadPersistedAnalysis() {
+      try {
+        const result = await apiFetch(
+          `/api/investigations/${selected.id}/analysis`,
+          {},
+          session
+        );
+        if (cancelled) return;
+
+        setAnalysisGraph(result.graph || { nodes: [], links: [] });
+        setGraph(result.graph || { nodes: [], links: [] });
+        setSelectedCriminal(null);
+        setSelectedRelationship(null);
+
+        setAnalysis((previous) => ({
+          ...(previous || {}),
+          ...result,
+          graph: result.graph || { nodes: [], links: [] },
+        }));
+      } catch (err) {
+        if (!cancelled) {
+          // A brand-new investigation may have no analysis yet.
+          if (!String(err.message || '').includes('404')) {
+            console.warn('Persisted analysis load skipped:', err.message);
+          }
+        }
+      }
+    }
+
+    loadPersistedAnalysis();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selected?.id, session?.access_token]);
+
+  useEffect(() => {
+    const graphApi = graphRef.current;
+    if (!graphApi) return;
+    const charge = graphApi.d3Force("charge");
+    const link = graphApi.d3Force("link");
+    if (charge?.strength) charge.strength(-900);
+    if (link?.distance) link.distance(230);
+    const simulation = graphApi.d3Force("center");
+    if (simulation?.strength) simulation.strength(0.08);
+    graphApi.d3ReheatSimulation?.();
+  }, [graph.nodes.length, graph.links.length]);
+
+  function closeInvestigation() {
+    if (!selected) return;
+    // This UI intentionally keeps case closure as an explicit state operation.
+    apiFetch(`/api/investigations/${selected.id}/close`, { method: "POST" }, session)
+      .then(() => loadInvestigations())
+      .catch((err) => setError(err.message || "Unable to close investigation."));
+  }
 
   async function signOut() {
     await supabase.auth.signOut();
-
+    resetCaseState();
     setSession(null);
     setProfile(null);
     setInvestigations([]);
     setSelected(null);
-    setFirText("");
-    setFirEntities([]);
-    setTipText("");
-    setTipResult(null);
-    setGraph({
-      nodes: [],
-      links: [],
-    });
-    setCriminalSearch("");
-    setCriminalResults([]);
-    setShowSearchResults(false);
-    setSelectedCriminal(null);
-    setSelectedRelationship(null);
-    setPeopleMap({});
-    setHoveredNode(null);
   }
 
-  // ============================================================
-  // LOADING SCREEN
-  // ============================================================
+  const visibleInvestigations = useMemo(() => {
+    return investigations.filter((item) => {
+      if (investigationFilter === "all") return true;
+      return item.status === investigationFilter;
+    });
+  }, [investigations, investigationFilter]);
+
+  const entityTotal = analysis
+    ? Object.values(analysis.entity_counts || {}).reduce((sum, value) => sum + Number(value || 0), 0)
+    : 0;
 
   if (loading) {
     return (
-      <div className="app-shell">
-        <div className="loading-screen">
-          <div className="loading-card">
-            <div className="loading-logo">
-              NYAYANET
-            </div>
-
-            <div className="loading-title">
-              LOADING SECURE WORKSPACE
-            </div>
-
-            <div className="loading-subtitle">
-              Authenticating investigative environment...
-            </div>
-          </div>
+      <div className="app-shell center-screen">
+        <div className="loading-card">
+          <div className="brand-mark large">N</div>
+          <div className="eyebrow">SECURE WORKSPACE</div>
+          <h1>NyayaNet</h1>
+          <p>Initializing investigative intelligence environment…</p>
         </div>
       </div>
     );
   }
-
-  // ============================================================
-  // LOGIN SCREEN
-  // ============================================================
 
   if (!session) {
     return (
-      <div className="app-shell">
-        <div className="auth-screen">
-          <div className="auth-card">
-
-            <div className="brand">
-              <div className="brand-mark">
-                N
-              </div>
-
-              <div>
-                <h1>NyayaNet</h1>
-                <p>
-                  AI-Powered Criminal Network Analysis
-                </p>
-              </div>
+      <div className="app-shell center-screen">
+        <div className="auth-card">
+          <div className="brand-row">
+            <div className="brand-mark">N</div>
+            <div>
+              <div className="brand-title">NyayaNet</div>
+              <div className="brand-subtitle">AI-POWERED CRIMINAL NETWORK ANALYSIS</div>
             </div>
-
-            <div className="auth-header">
-              <h2>
-                {isSignup
-                  ? "Create Account"
-                  : "Secure Login"}
-              </h2>
-
-              <p>
-                Authorized investigative intelligence platform
-              </p>
-            </div>
-
-            {error && (
-              <div className="error-box">
-                {error}
-              </div>
+          </div>
+          <div className="auth-header">
+            <span className="eyebrow">AUTHORIZED ACCESS</span>
+            <h1>{isSignup ? "Create Investigator Account" : "Secure Login"}</h1>
+            <p>Investigative intelligence workspace for authorized personnel.</p>
+          </div>
+          {error && <div className="error-box">{error}</div>}
+          <form onSubmit={handleAuth} className="stack-form">
+            {isSignup && (
+              <label>Full Name<input value={fullName} onChange={(e) => setFullName(e.target.value)} /></label>
             )}
-
-            <form onSubmit={handleAuth}>
-
-              {isSignup && (
-                <div className="form-group">
-                  <label>Full Name</label>
-
-                  <input
-                    type="text"
-                    placeholder="Enter your full name"
-                    value={fullName}
-                    onChange={(e) =>
-                      setFullName(e.target.value)
-                    }
-                  />
-                </div>
-              )}
-
-              <div className="form-group">
-                <label>Email</label>
-
-                <input
-                  type="email"
-                  placeholder="investigator@example.com"
-                  value={email}
-                  onChange={(e) =>
-                    setEmail(e.target.value)
-                  }
-                />
-              </div>
-
-              <div className="form-group">
-                <label>Password</label>
-
-                <input
-                  type="password"
-                  placeholder="Enter password"
-                  value={password}
-                  onChange={(e) =>
-                    setPassword(e.target.value)
-                  }
-                />
-              </div>
-
-              <button
-                type="submit"
-                className="primary-button"
-                disabled={authLoading}
-              >
-                {authLoading
-                  ? "Authenticating..."
-                  : isSignup
-                  ? "Create Account"
-                  : "Login Securely"}
-              </button>
-            </form>
-
-            <button
-              className="switch-auth"
-              onClick={() => {
-                setIsSignup(!isSignup);
-                setError("");
-              }}
-            >
-              {isSignup
-                ? "Already have an account? Login"
-                : "Need an account? Create one"}
-            </button>
-
-            <div className="security-note">
-              🔒 Access is controlled through Supabase
-              authentication and authorization.
-            </div>
-
-          </div>
+            <label>Email<input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="investigator@example.gov" /></label>
+            <label>Password<input type="password" value={password} onChange={(e) => setPassword(e.target.value)} /></label>
+            <button className="primary-button" disabled={authLoading}>{authLoading ? "Authenticating…" : isSignup ? "Create Account" : "Login Securely"}</button>
+          </form>
+          <button className="link-button" onClick={() => { setIsSignup((value) => !value); setError(""); }}>
+            {isSignup ? "Already have an account? Login" : "Need an account? Create one"}
+          </button>
         </div>
       </div>
     );
   }
 
-  // ============================================================
-  // UNAUTHORIZED USER
-  // ============================================================
-
-  if (!profile || profile.is_authorized !== true) {
+  if (!profile?.is_authorized) {
     return (
-      <div className="app-shell">
-        <div className="restricted-screen">
-
-          <div className="restricted-card">
-
-            <div className="restricted-icon">
-              🔒
-            </div>
-
-            <h1>Access Restricted</h1>
-
-            <p>
-              Your account is authenticated, but you are
-              not currently authorized to access the
-              investigative workspace.
-            </p>
-
-            <div className="restricted-user">
-              <strong>
-                {profile?.full_name ||
-                  session.user.email}
-              </strong>
-
-              <span>
-                {profile?.role ||
-                  "Unauthorized User"}
-              </span>
-            </div>
-
-            <button
-              className="ghost"
-              onClick={signOut}
-            >
-              Sign Out
-            </button>
-
-          </div>
-
+      <div className="app-shell center-screen">
+        <div className="auth-card restricted-card">
+          <div className="restricted-icon">🔒</div>
+          <span className="eyebrow">ACCESS CONTROL</span>
+          <h1>Access Restricted</h1>
+          <p>Your account is authenticated but is not currently authorized for the investigative workspace.</p>
+          <button className="ghost-button" onClick={signOut}>Sign Out</button>
         </div>
       </div>
     );
   }
-
-  // ============================================================
-  // MAIN AUTHORIZED DASHBOARD
-  // ============================================================
 
   return (
-    <div className="app-shell">
-
-      {/* ========================================================
-          SIDEBAR
-      ======================================================== */}
-
+    <div className="app-shell dashboard-shell">
       <aside className="sidebar">
-
-        <div className="sidebar-brand">
-
-          <div className="brand-mark">
-            N
+        <div>
+          <div className="brand-row sidebar-brand">
+            <div className="brand-mark">N</div>
+            <div>
+              <div className="brand-title">NyayaNet</div>
+              <div className="brand-subtitle">INVESTIGATIVE INTELLIGENCE</div>
+            </div>
           </div>
 
-          <div>
-            <h1>NyayaNet</h1>
-
-            <span>
-              INVESTIGATIVE INTELLIGENCE
-            </span>
-          </div>
-
-        </div>
-
-        <div className="sidebar-section">
-
-          <div className="sidebar-section-header">
+          <div className="sidebar-heading-row">
             <span>INVESTIGATIONS</span>
+            <button className="small-primary" onClick={() => { setError(""); setShowCreateModal(true); }}>+ New</button>
+          </div>
 
-            <button
-              className="new-investigation-button"
-              onClick={() =>
-                setShowCreateModal(true)
-              }
-            >
-              + New
-            </button>
+          <div className="filter-pills">
+            {[
+              ["active", "Ongoing"],
+              ["closed", "Closed"],
+              ["all", "All"],
+            ].map(([value, label]) => (
+              <button key={value} className={investigationFilter === value ? "active" : ""} onClick={() => setInvestigationFilter(value)}>
+                {label}
+              </button>
+            ))}
           </div>
 
           <div className="investigation-list">
-
-            {investigations.length === 0 ? (
-              <div className="sidebar-empty">
-                No investigations yet.
-              </div>
-            ) : (
-              investigations.map((investigation) => (
-                <button
-                  key={investigation.id}
-                  className={`investigation-item ${
-                    selected?.id === investigation.id
-                      ? "active"
-                      : ""
-                  }`}
-                  onClick={() => {
-                    setSelected(investigation);
-
-                    setTipResult(null);
-                    setFirEntities([]);
-
-                    setGraph({
-                      nodes: [],
-                      links: [],
-                    });
-                    setCriminalSearch("");
-                    setCriminalResults([]);
-                    setShowSearchResults(false);
-                    setSelectedCriminal(null);
-                    setSelectedRelationship(null);
-                    setPeopleMap({});
-                    setHoveredNode(null);
-                  }}
-                >
-                  <span className="investigation-code">
-                    {investigation.investigation_code}
-                  </span>
-
-                  <strong>
-                    {investigation.title}
-                  </strong>
-
-                  <small>
-                    {investigation.status}
-                  </small>
-                </button>
-              ))
-            )}
-
+            {visibleInvestigations.length === 0 ? (
+              <div className="sidebar-empty">No {investigationFilter === "all" ? "" : investigationFilter} investigations.</div>
+            ) : visibleInvestigations.map((investigation) => (
+              <button
+                key={investigation.id}
+                className={`investigation-item ${selected?.id === investigation.id ? "active" : ""}`}
+                onClick={() => {
+                  setSelected(investigation);
+                  resetCaseState();
+                }}
+              >
+                <span className="investigation-code">{investigation.investigation_code}</span>
+                <strong>{investigation.title}</strong>
+                <span className={`status-badge ${investigation.status}`}>{investigation.status}</span>
+              </button>
+            ))}
           </div>
         </div>
 
         <div className="sidebar-bottom">
-
           <div className="user-card">
-
-            <div className="user-avatar">
-              {(profile.full_name ||
-                session.user.email ||
-                "U")
-                .charAt(0)
-                .toUpperCase()}
+            <div className="user-avatar">{initials(profile.full_name || session.user.email)}</div>
+            <div>
+              <strong>{profile.full_name || session.user.email}</strong>
+              <span>{profile.role || "investigator"}</span>
             </div>
-
-            <div className="user-info">
-              <strong>
-                {profile.full_name ||
-                  session.user.email}
-              </strong>
-
-              <span>
-                {profile.role ||
-                  "Investigator"}
-              </span>
-            </div>
-
           </div>
-
-          <button
-            className="logout-button"
-            onClick={signOut}
-          >
-            Sign Out
-          </button>
-
+          <button className="logout-button" onClick={signOut}>Sign Out</button>
+          <div className="security-note">🔐 Authorized access • investigative actions are audited</div>
         </div>
-
       </aside>
 
-      {/* ========================================================
-          MAIN CONTENT
-      ======================================================== */}
-
-      <main className="main">
-
-        {/* HEADER */}
-
+      <main className="main-content">
         <header className="topbar">
-
           <div>
-            <div className="eyebrow">
-              SECURE INVESTIGATIVE WORKSPACE
-            </div>
-
-            <h2>
-              Criminal Network Analysis
-            </h2>
+            <div className="eyebrow">SECURE INVESTIGATIVE WORKSPACE</div>
+            <h1>Criminal Network Analysis</h1>
+            <p>Collect intelligence, extract entities, discover candidate relationships, and surface suspicious patterns.</p>
           </div>
-
-          <div className="topbar-status">
-            <span className="status-dot"></span>
-            AUTHORIZED
-          </div>
-
+          <div className="authorized-pill"><span /> AUTHORIZED</div>
         </header>
 
-        {/* ERROR */}
+        {error && <div className="error-box main-error"><span>{error}</span><button onClick={() => setError("")}>×</button></div>}
 
-        {error && (
-          <div className="error-box main-error">
-            {error}
-
-            <button
-              onClick={() => setError("")}
-            >
-              ×
-            </button>
-          </div>
-        )}
-
-        {/* ======================================================
-            SELECTED INVESTIGATION
-        ====================================================== */}
-
-        {selected ? (
-          <section className="investigation-banner">
-
-            <div>
-              <span>
-                ACTIVE INVESTIGATION
-              </span>
-
-              <h3>
-                {selected.title}
-              </h3>
-
-              <p>
-                {selected.description ||
-                  "No investigation description provided."}
-              </p>
-            </div>
-
-            <div className="investigation-id">
-
-              <span>
-                INVESTIGATION ID
-              </span>
-
-              <strong>
-                {selected.investigation_code}
-              </strong>
-
-            </div>
-
+        {!selected ? (
+          <section className="empty-dashboard panel">
+            <div className="empty-icon">+</div>
+            <div className="eyebrow">INVESTIGATION WORKSPACE</div>
+            <h2>Start a New Investigation</h2>
+            <p>Create a case, provide the available intelligence sources, and let NyayaNet build the analytical view.</p>
+            <button className="primary-button compact" onClick={() => setShowCreateModal(true)}>Start New Investigation</button>
           </section>
         ) : (
-          <section className="empty-dashboard">
-
-            <div className="empty-icon">
-              +
-            </div>
-
-            <h2>
-              Select an Investigation
-            </h2>
-
-            <p>
-              Select an existing investigation from
-              the sidebar or create a new one.
-            </p>
-
-            <button
-              onClick={() =>
-                setShowCreateModal(true)
-              }
-            >
-              Create Investigation
-            </button>
-
-          </section>
-        )}
-
-        {/* ======================================================
-            FIR INTELLIGENCE
-        ====================================================== */}
-
-        <section className="panel">
-
-          <div className="panel-header">
-
-            <div>
-              <div className="eyebrow">
-                NLP ENGINE
+          <>
+            <section className="case-banner panel">
+              <div>
+                <div className="eyebrow">ACTIVE CASE</div>
+                <h2>{selected.title}</h2>
+                <p>{selected.description || "No case description provided."}</p>
               </div>
-
-              <h2>
-                FIR Intelligence
-              </h2>
-
-              <p className="muted">
-                Extract people, locations, organizations,
-                phones, vehicles and other entities from
-                investigation documents.
-              </p>
-            </div>
-
-            <div className="panel-badge">
-              AI
-            </div>
-
-          </div>
-
-          {!selected ? (
-            <div className="empty-state">
-              Select an investigation first.
-            </div>
-          ) : (
-            <>
-              <div className="selected-investigation">
-
-                <span>
-                  ACTIVE INVESTIGATION
-                </span>
-
-                <strong>
-                  {selected.investigation_code}
-                </strong>
-
-                <small>
-                  {selected.title}
-                </small>
-
-              </div>
-
-              <textarea
-                className="fir-input"
-                placeholder="Paste FIR / police report / intelligence report here..."
-                rows={12}
-                value={firText}
-                onChange={(e) =>
-                  setFirText(e.target.value)
-                }
-              />
-
-              <div className="fir-actions">
-
-                <button
-                  onClick={analyzeFIR}
-                  disabled={
-                    firAnalyzing ||
-                    !firText.trim()
-                  }
-                >
-                  {firAnalyzing
-                    ? "Analyzing..."
-                    : "Analyze FIR"}
+              <div className="case-meta">
+                <span>INVESTIGATION ID</span>
+                <strong>{selected.investigation_code}</strong>
+                <button className="ghost-button small" onClick={closeInvestigation} disabled={selected.status === "closed"}>
+                  {selected.status === "closed" ? "Investigation Closed" : "Close Investigation"}
                 </button>
-
-                <button
-                  className="ghost"
-                  onClick={() => {
-                    setFirText("");
-                    setFirEntities([]);
-                  }}
-                >
-                  Clear
-                </button>
-
               </div>
+            </section>
 
-              {/* ENTITY RESULTS */}
+            <section className="stats-grid">
+              <div className="stat-card"><span>SOURCES PROCESSED</span><strong>{analysis?.sources?.length || 0}</strong><small>documents in this analysis</small></div>
+              <div className="stat-card"><span>ENTITIES EXTRACTED</span><strong>{entityTotal}</strong><small>people, places, vehicles & more</small></div>
+              <div className="stat-card"><span>CANDIDATE LINKS</span><strong>{analysis?.candidate_relationships?.length || 0}</strong><small>model-scored analytical leads</small></div>
+              <div className="stat-card alert-stat"><span>SUSPICIOUS PATTERNS</span><strong>{analysis?.suspicious_patterns?.length || 0}</strong><small>requires investigator review</small></div>
+            </section>
 
-              {firEntities.length > 0 && (
-                <div className="entity-results">
-
-                  <div className="panel-header">
-
-                    <div>
-                      <h3>
-                        Extracted Entities
-                      </h3>
-
-                      <p className="muted">
-                        Entities identified by the
-                        NLP processing pipeline.
-                      </p>
-                    </div>
-
-                    <div className="entity-count">
-                      {firEntities.length} found
-                    </div>
-
-                  </div>
-
-                  <div className="entity-grid">
-
-                    {firEntities.map(
-                      (entity, index) => (
-                        <div
-                          className="entity-card"
-                          key={`${entity.text}-${index}`}
-                        >
-
-                          <span className="entity-type">
-                            {entity.label ||
-                              entity.type ||
-                              "ENTITY"}
-                          </span>
-
-                          <strong>
-                            {entity.text}
-                          </strong>
-
-                        </div>
-                      )
-                    )}
-
-                  </div>
-
+            <section className="panel source-panel">
+              <div className="section-header">
+                <div>
+                  <div className="eyebrow">DATA INGESTION</div>
+                  <h2>Add Intelligence Sources</h2>
+                  <p>Provide available intelligence. The system keeps the original text, extracts entities, and builds candidate evidence across sources.</p>
                 </div>
-              )}
-
-            </>
-          )}
-
-        </section>
-
-        {/* ======================================================
-            TIP ANALYSIS
-        ====================================================== */}
-
-        <section className="panel">
-
-          <div className="panel-header">
-
-            <div>
-              <div className="eyebrow">
-                INTELLIGENCE INPUT
+                <div className="pipeline-badge">INGEST → NLP → GRAPH → ANALYTICS</div>
               </div>
 
-              <h2>
-                Tip → Network Analysis
-              </h2>
-
-              <p className="muted">
-                Provide a small piece of intelligence
-                and let the system identify possible
-                entities and relationships.
-              </p>
-            </div>
-
-          </div>
-
-          {!selected ? (
-            <div className="empty-state">
-              Select an investigation first.
-            </div>
-          ) : (
-            <>
-              <textarea
-                className="fir-input"
-                placeholder="Enter an intelligence tip..."
-                rows={7}
-                value={tipText}
-                onChange={(e) =>
-                  setTipText(e.target.value)
-                }
-              />
-
-              <div className="fir-actions">
-
-                <button
-                  onClick={analyzeTip}
-                  disabled={
-                    tipAnalyzing ||
-                    !tipText.trim()
-                  }
-                >
-                  {tipAnalyzing
-                    ? "Analyzing..."
-                    : "Analyze Tip"}
-                </button>
-
-                <button
-                  className="ghost"
-                  onClick={() => {
-                    setTipText("");
-                    setTipResult(null);
-                  }}
-                >
-                  Clear
-                </button>
-
-              </div>
-
-              {tipResult && (
-                <div className="tip-result">
-
-                  <h3>
-                    Analysis Result
-                  </h3>
-
-                  <pre>
-                    {JSON.stringify(
-                      tipResult,
-                      null,
-                      2
-                    )}
-                  </pre>
-
-                </div>
-              )}
-
-            </>
-          )}
-
-        </section>
-
-        {/* ======================================================
-            NETWORK GRAPH
-        ====================================================== */}
-
-        <section className="panel graph-panel network-explorer-panel">
-
-          <div className="network-explorer-header">
-            <div>
-              <div className="eyebrow">NETWORK INTELLIGENCE</div>
-              <h2>Criminal Network Explorer</h2>
-              <p className="muted">
-                Search for a person and explore their connected network.
-              </p>
-            </div>
-
-            <div className="network-legend">
-              <span className="legend-item">
-                <i className="legend-dot selected"></i>
-                Selected Subject
-              </span>
-              <span className="legend-item">
-                <i className="legend-dot connected"></i>
-                Connected Person
-              </span>
-              <span className="legend-item">
-                <i className="legend-info">i</i>
-                Hover for details
-              </span>
-            </div>
-          </div>
-
-          {!selected ? (
-            <div className="empty-state">Select an investigation first.</div>
-          ) : (
-            <>
-              {/* SEARCH + RESULTS */}
-              <div className="network-search-layout">
-                <div className="network-search-card">
-                  <div className="search-card-title">
-                    <div>
-                      <span className="search-card-eyebrow">SUBJECT SEARCH</span>
-                      <h3>Search Criminal</h3>
+              <div className="source-grid">
+                {SOURCE_TYPES.map((source) => (
+                  <div className="source-card" key={source.key}>
+                    <div className="source-card-head">
+                      <span className="source-icon">{source.icon}</span>
+                      <div><strong>{source.label}</strong><small>{source.hint}</small></div>
                     </div>
-                    <span className="search-icon-badge">⌕</span>
-                  </div>
-
-                  <div className="network-search-wrapper">
-                    <span className="network-search-icon">⌕</span>
-                    <input
-                      type="text"
-                      className="network-search-input"
-                      placeholder="Search by name, phone, vehicle or organization..."
-                      value={criminalSearch}
-                      onChange={(e) => {
-                        const value = e.target.value;
-                        setCriminalSearch(value);
-                        searchCriminals(value);
-                      }}
-                      onFocus={() => {
-                        if (criminalResults.length) setShowSearchResults(true);
-                      }}
+                    <textarea
+                      rows={5}
+                      placeholder={`Paste ${source.label.toLowerCase()} here…`}
+                      value={sourceDrafts[source.key]}
+                      onChange={(e) => setSourceDrafts((prev) => ({ ...prev, [source.key]: e.target.value }))}
                     />
-                    {criminalSearch && (
-                      <button
-                        type="button"
-                        className="network-search-clear"
-                        onClick={clearCriminalSearch}
-                        aria-label="Clear search"
-                      >
-                        ×
-                      </button>
+                    {source.key === "FIR" && (
+                      <select value={sourceLanguage} onChange={(e) => setSourceLanguage(e.target.value)}>
+                        <option value="en">FIR language: English</option>
+                        <option value="hi">FIR language: Hindi</option>
+                        <option value="pa">FIR language: Punjabi</option>
+                      </select>
                     )}
-                    {searchLoading && <span className="network-search-spinner">Searching…</span>}
                   </div>
+                ))}
+              </div>
 
-                  <p className="search-helper">
-                    Search by name, phone number, vehicle number, or organization.
-                  </p>
+              <div className="source-actions">
+                <button className="primary-button" onClick={analyzeSourcesForExistingCase} disabled={analysisLoading}>
+                  {analysisLoading ? "Running Intelligence Analysis…" : "Run Intelligence Analysis"}
+                </button>
+                <span>At least one source is required. Add only the sources available for the case.</span>
+              </div>
+            </section>
 
-                  {showSearchResults && criminalSearch.trim() && (
-                    <div className="network-search-results">
-                      <div className="results-header">
-                        <span>SEARCH RESULTS</span>
-                        <b>{criminalResults.length}</b>
-                      </div>
+            <section className="analytics-grid">
+              <div className="panel analysis-card">
+                <div className="section-header compact-header"><div><div className="eyebrow">NETWORK INTELLIGENCE</div><h2>Influential Individuals</h2></div></div>
+                <div className="rank-list">
+                  {(analysis?.influential_persons || []).slice(0, 6).map((person, index) => (
+                    <div className="rank-row" key={person.person_id}>
+                      <span className="rank-number">{index + 1}</span>
+                      <div><strong>{person.name}</strong><small>{person.person_id}</small></div>
+                      <div className="rank-score">{Math.round((person.influence_score || 0) * 100)}<small>influence</small></div>
+                    </div>
+                  ))}
+                  {!analysis?.influential_persons?.length && <div className="empty-inline">Run intelligence analysis to identify network-central individuals.</div>}
+                </div>
+              </div>
 
-                      {criminalResults.length > 0 ? (
-                        criminalResults.map((person) => (
-                          <button
-                            type="button"
-                            key={person.id}
-                            className="network-result-item"
-                            onClick={() => loadCriminalNetwork(person)}
-                          >
-                            <div className="result-avatar">
-                              {(person.name || "?")
-                                .split(" ")
-                                .map((part) => part[0])
-                                .join("")
-                                .slice(0, 2)
-                                .toUpperCase()}
-                            </div>
-                            <div className="result-person">
-                              <strong>{person.name}</strong>
-                              <span>
-                                {person.person_id}
-                                {person.location ? ` · ${person.location}` : ""}
-                              </span>
-                              {person.phone_num && <small>☎ {person.phone_num}</small>}
-                            </div>
-                            <span className="result-arrow">›</span>
-                          </button>
-                        ))
-                      ) : !searchLoading ? (
-                        <div className="network-no-results">
-                          No matching person found.
-                        </div>
-                      ) : null}
+              <div className="panel analysis-card">
+                <div className="section-header compact-header"><div><div className="eyebrow">PATTERN DETECTION</div><h2>Suspicious Activity Signals</h2></div></div>
+                <div className="pattern-list">
+                  {(analysis?.suspicious_patterns || []).slice(0, 6).map((pattern, index) => (
+                    <div className="pattern-row" key={`${pattern.person_a_id}-${pattern.person_b_id}-${index}`}>
+                      <div className="pattern-icon">!</div>
+                      <div><strong>{pattern.person_a_id} ↔ {pattern.person_b_id}</strong><small>{(pattern.reasons || []).join(" • ") || "Unusual activity combination"}</small></div>
+                      <span>{Math.round((pattern.confidence || 0) * 100)}%</span>
+                    </div>
+                  ))}
+                  {!analysis?.suspicious_patterns?.length && <div className="empty-inline">No suspicious combinations surfaced yet.</div>}
+                </div>
+              </div>
+            </section>
+
+            <section className="panel network-workspace">
+              <div className="section-header">
+                <div>
+                  <div className="eyebrow">NETWORK INTELLIGENCE</div>
+                  <h2>Criminal Network Explorer</h2>
+                  <p>NyayaNet builds this network automatically from the intelligence submitted to this investigation. Search is used to focus the generated network on a subject.</p>
+                </div>
+                <div className="legend"><span><i className="legend-dot selected" /> Selected Subject</span><span><i className="legend-dot connected" /> Connected Person</span><span>Hover a node for profile details</span></div>
+              </div>
+
+              <div className="network-topbar">
+                <div className="search-panel">
+                  <label>FOCUS WITHIN GENERATED NETWORK</label>
+                  <div className="search-input-wrap">
+                    <span>⌕</span>
+                    <input
+                      value={criminalSearch}
+                      placeholder="Search a person from this investigation…"
+                      onChange={(e) => setCriminalSearch(e.target.value)}
+                      onFocus={() => criminalResults.length && setShowSearchResults(true)}
+                    />
+                    {criminalSearch && <button onClick={resetGraphView}>×</button>}
+                    {searchLoading && <em>Searching…</em>}
+                  </div>
+                  {showSearchResults && (
+                    <div className="search-results">
+                      <div className="search-results-title">MATCHING RECORDS <span>{criminalResults.length}</span></div>
+                      {criminalResults.length ? criminalResults.map((person) => (
+                        <button key={person.id} className="search-result-row" onClick={() => selectCriminal(person)}>
+                          <div className="result-avatar">{initials(person.name)}</div>
+                          <div className="result-main"><strong>{person.name}</strong><small>{person.person_id} · {person.location || "Location unavailable"}</small><span>☎ {person.phone_num || "No phone"}</span></div>
+                          <span className="result-arrow">›</span>
+                        </button>
+                      )) : <div className="empty-inline">No matching person found.</div>}
                     </div>
                   )}
                 </div>
 
-                {/* SELECTED SUBJECT SUMMARY */}
                 {selectedCriminal && (
-                  <div className="subject-summary-card">
-                    <div className="subject-avatar-large">
-                      {(selectedCriminal.name || "?")
-                        .split(" ")
-                        .map((part) => part[0])
-                        .join("")
-                        .slice(0, 2)
-                        .toUpperCase()}
-                    </div>
-                    <div className="subject-main">
-                      <span>SELECTED SUBJECT</span>
-                      <strong>{selectedCriminal.name}</strong>
-                      <small>
-                        {selectedCriminal.person_id}
-                        {selectedCriminal.location ? ` · ${selectedCriminal.location}` : ""}
-                      </small>
-                    </div>
-                    <div className="subject-stat">
-                      <span>AGE</span>
-                      <strong>{selectedCriminal.age ?? "N/A"}</strong>
-                    </div>
-                    <div className="subject-stat">
-                      <span>CONNECTIONS</span>
-                      <strong>{Math.max(0, graph.nodes.length - 1)}</strong>
-                    </div>
-                    <div className="subject-stat subject-wide">
-                      <span>PHONE</span>
-                      <strong>{selectedCriminal.phone_num || "N/A"}</strong>
-                    </div>
-                    <div className="subject-stat subject-wide">
-                      <span>VEHICLE</span>
-                      <strong>{selectedCriminal.vehicle_num || "N/A"}</strong>
-                    </div>
+                  <div className="subject-summary">
+                    <div className="subject-avatar">{initials(selectedCriminal.name)}</div>
+                    <div className="subject-main"><span>SELECTED SUBJECT</span><strong>{selectedCriminal.name}</strong><small>{selectedCriminal.person_id} · {selectedCriminal.location || "Location unavailable"}</small></div>
+                    <div className="subject-metric"><span>AGE</span><strong>{selectedCriminal.age || "—"}</strong></div>
+                    <div className="subject-metric"><span>CONNECTIONS</span><strong>{selectedCriminal ? Math.max(0, graph.nodes.length - 1) : analysisGraph.links.length}</strong></div>
+                    <div className="subject-metric"><span>PHONE</span><strong>{selectedCriminal.phone_num || "—"}</strong></div>
+                    <div className="subject-metric"><span>VEHICLE</span><strong>{selectedCriminal.vehicle_num || "—"}</strong></div>
                   </div>
                 )}
               </div>
 
-              {/* GRAPH + DETAILS */}
-              {!selectedCriminal ? (
-                <div className="network-empty-state">
-                  <div className="network-empty-icon">⌕</div>
-                  <h3>Search for a Criminal</h3>
-                  <p>
-                    Select a person from the search results to build their relationship network.
-                  </p>
-                </div>
-              ) : graphLoading ? (
-                <div className="network-empty-state">
-                  <div className="network-loading-ring"></div>
-                  <h3>Building Network</h3>
-                  <p>Finding all recorded connections for {selectedCriminal.name}…</p>
-                </div>
-              ) : (
-                <div className="network-workspace">
-                  <div className="network-graph-card">
-                    <div className="network-graph-toolbar">
-                      <div>
-                        <span>RELATIONSHIP MAP</span>
-                        <strong>
-                          {graph.links.length} connection{graph.links.length === 1 ? "" : "s"} found
-                        </strong>
-                      </div>
-                      <button
-                        type="button"
-                        className="network-reset-button"
-                        onClick={() => {
-                          setSelectedRelationship(null);
-                          setHoveredNode(null);
-                        }}
-                      >
-                        ↻ Reset View
-                      </button>
-                    </div>
-
-                    <div className="network-canvas-wrap">
+              <div className={`network-body ${selectedRelationship ? "with-details" : ""}`}>
+                <div className="graph-panel">
+                  <div className="graph-titlebar"><div><span>RELATIONSHIP MAP</span><strong>{selectedCriminal ? `${Math.max(0, graph.nodes.length - 1)} connections in focus` : `${analysisGraph.links.length} candidate connections generated from submitted evidence`}</strong></div><button className="ghost-button small" onClick={() => { resetGraphView(); setTimeout(() => graphRef.current?.zoomToFit?.(500, 80), 0); }}>Reset View</button></div>
+                  <div className="graph-canvas">
+                    {graphLoading ? (
+                      <div className="graph-placeholder"><div className="spinner" /><h3>Building subject network…</h3><p>Combining relationship records and model signals.</p></div>
+                    ) : graph.nodes.length === 0 ? (
+                      <div className="graph-placeholder"><div className="placeholder-icon">◌</div><h3>No network generated yet</h3><p>Submit at least one intelligence source and run analysis. The graph is generated only from this investigation's submitted evidence.</p></div>
+                    ) : (
                       <ForceGraph2D
                         ref={graphRef}
                         graphData={graph}
-                        width={undefined}
-                        height={680}
-                        backgroundColor="#07101d"
-                        nodeLabel={(node) => {
-                          const esc = (value) =>
-                            String(value ?? "N/A")
-                              .replace(/&/g, "&amp;")
-                              .replace(/</g, "&lt;")
-                              .replace(/>/g, "&gt;")
-                              .replace(/\"/g, "&quot;");
-
-                          return `
-                            <div class="nyayanet-node-tooltip">
-                              <div class="nyayanet-tooltip-title">${esc(node.name || "Unknown")}</div>
-                              <div class="nyayanet-tooltip-id">${esc(node.id || "N/A")}</div>
-                              <div class="nyayanet-tooltip-divider"></div>
-                              <div class="nyayanet-tooltip-grid">
-                                <div><span>AGE</span><b>${esc(node.age)}</b></div>
-                                <div><span>LOCATION</span><b>${esc(node.location)}</b></div>
-                                <div><span>PHONE</span><b>${esc(node.phone_num)}</b></div>
-                                <div><span>VEHICLE</span><b>${esc(node.vehicle_num)}</b></div>
-                                <div><span>ORGANIZATION</span><b>${esc(node.org)}</b></div>
-                                <div><span>CRIME RECORDED</span><b>${esc(node.crime_recorded)}</b></div>
-                              </div>
-                            </div>
-                          `;
-                        }}
-                        linkLabel={(link) =>
-                          `${link.relationship_type || "Potential Relationship"}${
-                            link.confidence != null
-                              ? ` — ${Math.round(link.confidence * 100)}% confidence`
-                              : ""
-                          }`
-                        }
-                        onNodeHover={(node) => {
-                          setHoveredNode(node || null);
-                        }}
-                        onBackgroundClick={() => {
-                          setHoveredNode(null);
-                          setSelectedRelationship(null);
-                        }}
-                        onLinkClick={(link) => setSelectedRelationship(link)}
-                        nodeCanvasObject={(node, ctx, globalScale) => {
-                          const isCenter = node.is_center;
-                          const isHovered = hoveredNode?.id === node.id;
-                          const radius = isCenter ? 30 : 21;
-                          const x = node.x || 0;
-                          const y = node.y || 0;
-
-                          ctx.save();
-
-                          if (isCenter) {
-                            ctx.beginPath();
-                            ctx.arc(x, y, radius + 8, 0, 2 * Math.PI);
-                            ctx.fillStyle = "rgba(31, 220, 126, 0.12)";
-                            ctx.fill();
-                          }
-
-                          ctx.beginPath();
-                          ctx.arc(x, y, radius, 0, 2 * Math.PI);
-                          ctx.fillStyle = isCenter ? "#0b3426" : "#111f34";
-                          ctx.fill();
-                          ctx.lineWidth = isHovered ? 4 : (isCenter ? 3 : 2);
-                          ctx.strokeStyle = isCenter ? "#25e58a" : (isHovered ? "#ffffff" : "#4f9cff");
-                          ctx.stroke();
-
-                          const initials = (node.name || "?")
-                            .split(" ")
-                            .map((part) => part[0])
-                            .join("")
-                            .slice(0, 2)
-                            .toUpperCase();
-
-                          const fontSize = Math.max(11, (isCenter ? 17 : 13) / globalScale);
-                          ctx.font = `600 ${fontSize}px Inter, system-ui, sans-serif`;
-                          ctx.textAlign = "center";
-                          ctx.textBaseline = "middle";
-                          ctx.fillStyle = "#f5f9ff";
-                          ctx.fillText(initials, x, y);
-
-                          if (globalScale > 0.65) {
-                            const labelSize = Math.max(9, 12 / globalScale);
-                            ctx.font = `600 ${labelSize}px Inter, system-ui, sans-serif`;
-                            ctx.fillStyle = "#e8eef8";
-                            ctx.fillText(node.name || "Unknown", x, y + radius + 17);
-
-                            if (isCenter) {
-                              ctx.font = `500 ${Math.max(8, 9 / globalScale)}px Inter, system-ui, sans-serif`;
-                              ctx.fillStyle = "#39e79a";
-                              ctx.fillText("SELECTED SUBJECT", x, y + radius + 31);
-                            }
-                          }
-
-                          ctx.restore();
-                        }}
-                        linkCanvasObjectMode={() => "after"}
-                        linkCanvasObject={(link, ctx, globalScale) => {
-                          if (!link.source || !link.target) return;
-                          const source = link.source;
-                          const target = link.target;
-                          if (typeof source.x !== "number" || typeof target.x !== "number") return;
-
-                          const label = link.relationship_type || "Related";
-                          const x = (source.x + target.x) / 2;
-                          const y = (source.y + target.y) / 2;
-                          const fontSize = Math.max(8, 11 / globalScale);
-
-                          ctx.save();
-                          ctx.font = `600 ${fontSize}px Inter, system-ui, sans-serif`;
-                          ctx.textAlign = "center";
-                          ctx.textBaseline = "middle";
-
-                          const metrics = ctx.measureText(label);
-                          const padX = 7;
-                          const padY = 4;
-
-                          ctx.fillStyle = "rgba(5, 12, 23, 0.92)";
-                          ctx.strokeStyle = "rgba(98, 154, 220, 0.35)";
-                          ctx.lineWidth = 1;
-                          ctx.beginPath();
-                          ctx.roundRect(
-                            x - metrics.width / 2 - padX,
-                            y - fontSize / 2 - padY,
-                            metrics.width + padX * 2,
-                            fontSize + padY * 2,
-                            6
-                          );
-                          ctx.fill();
-                          ctx.stroke();
-
-                          ctx.fillStyle = "#8ec5ff";
-                          ctx.fillText(label, x, y);
-                          ctx.restore();
-                        }}
-                        nodePointerAreaPaint={(node, color, ctx) => {
-                          ctx.fillStyle = color;
-                          ctx.beginPath();
-                          ctx.arc(node.x || 0, node.y || 0, node.is_center ? 48 : 38, 0, 2 * Math.PI);
-                          ctx.fill();
-                        }}
-                        linkDirectionalArrowLength={7}
-                        linkDirectionalArrowRelPos={0.94}
-                        linkCurvature={0.08}
-                        linkColor={(link) => {
-                          if (selectedRelationship === link) return "#63b3ff";
-                          return "rgba(82, 154, 236, 0.72)";
-                        }}
-                        linkWidth={(link) =>
-                          selectedRelationship === link ? 3.5 : 1.6
-                        }
-                        linkDistance={300}
-                        d3AlphaMin={0.001}
-                        nodeRelSize={6}
-                        warmupTicks={120}
-                        cooldownTicks={360}
+                        backgroundColor="#06101f"
+                        enableNodeDrag
+                        cooldownTicks={220}
                         d3AlphaDecay={0.018}
                         d3VelocityDecay={0.28}
-                        onEngineStop={() => {
-                          if (graphRef.current) {
-                            graphRef.current.zoomToFit(500, 70);
-                          }
+                        nodeRelSize={7}
+                        nodeAutoColorBy="is_center"
+                        nodeLabel={(node) => `
+                          <div class="node-tooltip">
+                            <div class="node-tooltip-head">
+                              <div class="node-tooltip-avatar">${escapeHtml(initials(node.name))}</div>
+                              <div><strong>${escapeHtml(node.name || "Unknown")}</strong><span>${escapeHtml(node.id || "")}</span></div>
+                            </div>
+                            <div class="node-tooltip-grid">
+                              <div><span>AGE</span><b>${escapeHtml(node.age ?? "—")}</b></div>
+                              <div><span>LOCATION</span><b>${escapeHtml(node.location || "—")}</b></div>
+                              <div><span>PHONE</span><b>${escapeHtml(node.phone_num || "—")}</b></div>
+                              <div><span>VEHICLE</span><b>${escapeHtml(node.vehicle_num || "—")}</b></div>
+                              <div><span>ORGANIZATION</span><b>${escapeHtml(node.org || "—")}</b></div>
+                              <div><span>CRIME RECORDED</span><b>${escapeHtml(node.crime_recorded || "—")}</b></div>
+                            </div>
+                          </div>`}
+                        linkLabel={(link) => `${link.relationship_type || "Potential Relationship"}${link.confidence != null ? ` • ${Math.round(link.confidence * 100)}%` : ""}`}
+                        linkDirectionalArrowLength={6}
+                        linkDirectionalArrowRelPos={1}
+                        linkCurvature={0.08}
+                        linkWidth={(link) => Math.max(1.5, 1 + Number(link.confidence || 0) * 2)}
+                        linkColor={() => "rgba(71, 170, 255, 0.72)"}
+                        nodeCanvasObject={(node, ctx, scale) => {
+                          const radius = node.is_center ? 13 : 9;
+                          ctx.beginPath();
+                          ctx.arc(node.x, node.y, radius, 0, Math.PI * 2);
+                          ctx.fillStyle = node.is_center ? "#083d2d" : "#0f2542";
+                          ctx.fill();
+                          ctx.lineWidth = node.is_center ? 3 : 2;
+                          ctx.strokeStyle = node.is_center ? "#2ee889" : "#4aa5ff";
+                          ctx.stroke();
+
+                          const label = node.name || "Unknown";
+                          const fontSize = Math.max(10, 12 / scale);
+                          ctx.font = `600 ${fontSize}px Inter, system-ui, sans-serif`;
+                          ctx.textAlign = "center";
+                          ctx.fillStyle = "#e9f1ff";
+                          ctx.fillText(label, node.x, node.y + radius + fontSize + 4);
+
+                          ctx.font = `500 ${Math.max(8, fontSize * 0.82)}px Inter, system-ui, sans-serif`;
+                          ctx.fillStyle = "#7f96b5";
+                          ctx.fillText(node.id || "", node.x, node.y + radius + fontSize * 2.25);
                         }}
-                        enableZoomInteraction={true}
-                        enablePanInteraction={true}
+                        linkCanvasObjectMode={() => "after"}
+                        linkCanvasObject={(link, ctx, scale) => {
+                          const source = link.source;
+                          const target = link.target;
+                          if (!source || !target || typeof source.x !== "number" || typeof target.x !== "number") return;
+                          const x = (source.x + target.x) / 2;
+                          const y = (source.y + target.y) / 2;
+                          const label = link.relationship_type || "Relationship";
+                          const confidence = link.confidence != null ? ` ${Math.round(link.confidence * 100)}%` : "";
+                          const text = `${label}${confidence}`;
+                          const fontSize = Math.max(8, 10.5 / scale);
+                          ctx.font = `600 ${fontSize}px Inter, system-ui, sans-serif`;
+                          const width = ctx.measureText(text).width + 10;
+                          ctx.fillStyle = "rgba(4, 13, 25, 0.90)";
+                          ctx.fillRect(x - width / 2, y - fontSize / 2 - 4, width, fontSize + 8);
+                          ctx.fillStyle = "#b8d8ff";
+                          ctx.textAlign = "center";
+                          ctx.textBaseline = "middle";
+                          ctx.fillText(text, x, y);
+                        }}
+                        onNodeDragEnd={(node) => {
+                          node.fx = null;
+                          node.fy = null;
+                          graphRef.current?.d3ReheatSimulation?.();
+                        }}
+                        onLinkClick={(link) => setSelectedRelationship(link)}
+                        onNodeClick={(node) => setSelectedCriminal((current) => current?.person_id === node.id ? current : current)}
+                        onEngineStop={() => graphRef.current?.zoomToFit?.(600, 100)}
                       />
-
-                      <div className="graph-controls-hint">
-                        Scroll to zoom · Drag to move · Click a relationship for details
-                      </div>
-                    </div>
+                    )}
+                    <div className="graph-help">Generated from current case evidence • Drag nodes • Scroll to zoom • Click a relationship for evidence details • Hover a node for profile information</div>
                   </div>
-
-                  {selectedRelationship && (
-                    <aside className="network-relationship-card">
-                      <div className="relationship-card-header">
-                        <div>
-                          <span>RELATIONSHIP DETAILS</span>
-                          <h3>Connection Intelligence</h3>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => setSelectedRelationship(null)}
-                          aria-label="Close relationship details"
-                        >
-                          ×
-                        </button>
-                      </div>
-
-                      <div className="relationship-subjects">
-                        <div>
-                          <span>{peopleMap[selectedRelationship.source] || selectedRelationship.source}</span>
-                          <small>{selectedRelationship.source}</small>
-                        </div>
-                        <b>↔</b>
-                        <div className="relationship-subject-right">
-                          <span>{peopleMap[selectedRelationship.target] || selectedRelationship.target}</span>
-                          <small>{selectedRelationship.target}</small>
-                        </div>
-                      </div>
-
-                      <div className="relationship-badge-row">
-                        <strong>{selectedRelationship.relationship_type || "Potential Relationship"}</strong>
-                        {selectedRelationship.confidence != null && (
-                          <span>{Math.round(selectedRelationship.confidence * 100)}% Confidence</span>
-                        )}
-                      </div>
-
-                      <div className="relationship-metrics-grid">
-                        <div><span>PHONE CALLS</span><strong>{selectedRelationship.calls || 0}</strong></div>
-                        <div><span>TRANSACTIONS</span><strong>{selectedRelationship.transactions || 0}</strong></div>
-                        <div><span>MEETINGS</span><strong>{selectedRelationship.meetings || 0}</strong></div>
-                        <div><span>TOTAL VALUE</span><strong>₹{Number(selectedRelationship.total_transaction_amount || 0).toLocaleString("en-IN")}</strong></div>
-                      </div>
-
-                      <div className="relationship-evidence-block">
-                        <span>EVIDENCE SUMMARY</span>
-                        <p>
-                          {selectedRelationship.relationship_description ||
-                            selectedRelationship.reason ||
-                            "No relationship explanation available."}
-                        </p>
-                      </div>
-                    </aside>
-                  )}
                 </div>
-              )}
 
-              <div className="network-footer-note">
-                <span className="network-footer-info">i</span>
-                Hover over any person node to view profile information. Click relationship lines to inspect communication, transaction and meeting evidence.
+                {selectedRelationship && (
+                  <aside className="relationship-panel">
+                    <div className="relationship-panel-head"><div><span className="eyebrow">RELATIONSHIP INTELLIGENCE</span><h3>Connection Details</h3></div><button onClick={() => setSelectedRelationship(null)}>×</button></div>
+                    <div className="relationship-subjects"><div><span>PERSON A</span><strong>{selectedRelationship.source}</strong></div><div className="relationship-arrow">↔</div><div><span>PERSON B</span><strong>{selectedRelationship.target}</strong></div></div>
+                    <div className="relationship-type-block"><span>RELATIONSHIP TYPE</span><strong>{selectedRelationship.relationship_type || "Potential Relationship"}</strong><em>{selectedRelationship.confidence != null ? `${Math.round(selectedRelationship.confidence * 100)}% analytical confidence` : "Confidence unavailable"}</em></div>
+                    <div className="relationship-metrics"><div><span>PHONE CALLS</span><strong>{selectedRelationship.calls || 0}</strong></div><div><span>TRANSACTIONS</span><strong>{selectedRelationship.transactions || 0}</strong></div><div><span>MEETINGS</span><strong>{selectedRelationship.meetings || 0}</strong></div><div><span>TRANSACTION VALUE</span><strong>₹{Number(selectedRelationship.total_transaction_amount || 0).toLocaleString("en-IN")}</strong></div></div>
+                    <div className="relationship-evidence"><span>EVIDENCE EXPLANATION</span><p>{selectedRelationship.relationship_description || selectedRelationship.reason || "No explanation is available for this candidate link."}</p></div>
+                    <div className="lead-warning">Analytical lead only. This score does not establish criminal guilt or prove the stated relationship.</div>
+                  </aside>
+                )}
               </div>
-            </>
-          )}
-        </section>
+            </section>
 
+            <section className="utility-grid">
+              <div className="panel">
+                <div className="section-header compact-header"><div><div className="eyebrow">NLP ENGINE</div><h2>Standalone FIR Intelligence</h2></div></div>
+                <textarea className="utility-textarea" rows={7} value={firText} onChange={(e) => setFirText(e.target.value)} placeholder="Paste an additional FIR / report for focused entity extraction…" />
+                <div className="utility-actions"><select value={sourceLanguage} onChange={(e) => setSourceLanguage(e.target.value)}><option value="en">English</option><option value="hi">Hindi</option><option value="pa">Punjabi</option></select><button className="primary-button" onClick={analyzeFIR} disabled={firAnalyzing}>{firAnalyzing ? "Analyzing…" : "Extract Entities"}</button></div>
+                {firEntities.length > 0 && <div className="entity-list">{firEntities.map((entity, index) => <div className="entity-chip" key={`${entity.label}-${entity.text}-${index}`}><span>{entity.label}</span><strong>{entity.text}</strong></div>)}</div>}
+              </div>
+
+              <div className="panel">
+                <div className="section-header compact-header"><div><div className="eyebrow">INTELLIGENCE SEED</div><h2>Tip → Network</h2></div></div>
+                <textarea className="utility-textarea" rows={7} value={tipText} onChange={(e) => setTipText(e.target.value)} placeholder="Enter a small tip or lead…" />
+                <button className="primary-button" onClick={analyzeTip} disabled={tipAnalyzing}>{tipAnalyzing ? "Analyzing…" : "Analyze Tip"}</button>
+                {tipResult && <pre className="tip-result">{JSON.stringify(tipResult, null, 2)}</pre>}
+              </div>
+            </section>
+
+            <section className="panel methodology-panel">
+              <div><div className="eyebrow">ANALYTICAL GUARDRAILS</div><h2>How NyayaNet interprets evidence</h2></div>
+              <div className="guardrail-grid"><div><strong>Candidate relationship score</strong><p>Ranks evidence-backed links using observable communication, transaction, meeting and shared-entity signals.</p></div><div><strong>Suspicious pattern detection</strong><p>Flags unusual combinations of activity for investigator review; it does not declare guilt.</p></div><div><strong>Network influence</strong><p>Uses graph-centrality measures to identify structurally influential nodes, not “most criminal” people.</p></div></div>
+            </section>
+          </>
+        )}
       </main>
 
-      {/* ========================================================
-          CREATE INVESTIGATION MODAL
-      ======================================================== */}
-
       {showCreateModal && (
-        <div
-          className="modal-backdrop"
-          onClick={() =>
-            setShowCreateModal(false)
-          }
-        >
-
-          <div
-            className="modal"
-            onClick={(e) =>
-              e.stopPropagation()
-            }
-          >
-
-            <div className="modal-header">
-
-              <div>
-                <div className="eyebrow">
-                  NEW CASE
-                </div>
-
-                <h2>
-                  Create Investigation
-                </h2>
-
-                <p className="muted">
-                  Create a secure investigation workspace.
-                </p>
-              </div>
-
-              <button
-                className="modal-close"
-                onClick={() =>
-                  setShowCreateModal(false)
-                }
-              >
-                ×
-              </button>
-
-            </div>
-
-            <div className="form-group">
-
-              <label>
-                Investigation Title
-              </label>
-
-              <input
-                type="text"
-                placeholder="e.g. Operation Red Lotus"
-                value={newTitle}
-                onChange={(e) =>
-                  setNewTitle(e.target.value)
-                }
-              />
-
-            </div>
-
-            <div className="form-group">
-
-              <label>
-                Description
-              </label>
-
-              <textarea
-                rows={6}
-                placeholder="Describe the purpose and scope of this investigation..."
-                value={newDescription}
-                onChange={(e) =>
-                  setNewDescription(
-                    e.target.value
-                  )
-                }
-              />
-
-            </div>
-
-            <div className="modal-actions">
-
-              <button
-                className="ghost"
-                onClick={() =>
-                  setShowCreateModal(false)
-                }
-              >
-                Cancel
-              </button>
-
-              <button
-                onClick={createInvestigation}
-                disabled={
-                  creating ||
-                  !newTitle.trim()
-                }
-              >
-                {creating
-                  ? "Creating..."
-                  : "Create Investigation"}
-              </button>
-
-            </div>
-
-          </div>
-
+        <div className="modal-backdrop" onMouseDown={(e) => e.target === e.currentTarget && !creating && setShowCreateModal(false)}>
+          <form className="create-modal" onSubmit={createInvestigation}>
+            <div className="modal-head"><div><div className="eyebrow">NEW INVESTIGATION</div><h2>Start Investigation Workspace</h2><p>Enter the case details and all available intelligence sources. NyayaNet will process them immediately after the case is created.</p></div><button type="button" onClick={() => !creating && setShowCreateModal(false)}>×</button></div>
+            <div className="modal-grid-top"><label>Investigation Title<input value={newTitle} onChange={(e) => setNewTitle(e.target.value)} placeholder="e.g. Network analysis — Sector 18" /></label><label>Case Purpose / Description<textarea rows={3} value={newDescription} onChange={(e) => setNewDescription(e.target.value)} placeholder="Scope, objective, known lead, or case summary…" /></label></div>
+            <div className="modal-source-header"><div><span>INTELLIGENCE SOURCES</span><small>Provide the sources available for this case. FIR is not the only accepted input.</small></div><select value={newFirLanguage} onChange={(e) => setNewFirLanguage(e.target.value)}><option value="en">FIR: English</option><option value="hi">FIR: Hindi</option><option value="pa">FIR: Punjabi</option></select></div>
+            <div className="modal-source-grid">{SOURCE_TYPES.map((source) => <div className="modal-source-card" key={source.key}><div><span>{source.icon}</span><strong>{source.label}</strong></div><textarea rows={4} value={newSources[source.key]} onChange={(e) => setNewSources((prev) => ({ ...prev, [source.key]: e.target.value }))} placeholder={`Enter ${source.label.toLowerCase()}…`} /></div>)}</div>
+            <div className="modal-foot"><span>At least one source must be supplied. Original evidence is stored with an integrity hash.</span><div><button type="button" className="ghost-button" onClick={() => setShowCreateModal(false)} disabled={creating}>Cancel</button><button type="submit" className="primary-button" disabled={creating}>{creating ? "Creating & Analyzing…" : "Create & Analyze Investigation"}</button></div></div>
+          </form>
         </div>
       )}
-
     </div>
   );
 }

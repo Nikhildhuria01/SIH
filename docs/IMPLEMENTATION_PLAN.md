@@ -1,52 +1,172 @@
-# Step-by-step implementation plan
+# NyayaNet — implementation plan aligned to the actual investigator workflow
 
-## Step 1 — establish the data contract
-Define canonical entity types and relation types before training models.
+## 1. Investigator access and case management
 
-Entity types: PERSON, ORG, LOCATION, PHONE, VEHICLE, ACCOUNT, DOCUMENT, EVENT.
+- Authorized login through Supabase Auth + `profiles.is_authorized`.
+- Sidebar separates ongoing, closed and all investigations.
+- Investigator can start a new investigation.
+- Investigator can close a completed investigation.
+- Each case has a generated investigation code.
 
-Relations: ASSOCIATED_WITH, CALLED, TRANSACTED_WITH, LOCATED_AT, WORKS_FOR, OWNS, MET, MENTIONED_IN.
+## 2. Multi-source investigation intake
 
-Every relationship should store: source, target, type, reason, confidence, evidence IDs, creator, timestamp, previous hash, current hash.
+A case can receive:
 
-## Step 2 — ingestion
-Build adapters that transform each source into one normalized event format. Preserve source metadata and original content.
+- FIR / police complaint
+- police reports
+- financial transaction records
+- surveillance reports
+- social-media intelligence
+- criminal-history records
 
-## Step 3 — NLP
-Run language detection → sentence segmentation → NER → normalization → entity resolution.
+The original source text is preserved with source type, title, language and content hash.
 
-Example normalization:
-- phones: E.164-ish canonical format
-- vehicles: uppercase and remove spaces/dashes
-- person names: whitespace/case normalization while retaining original display value
+## 3. Entity intelligence
 
-## Step 4 — entity resolution
-Use exact rules first, then fuzzy similarity/embeddings. Never auto-merge high-impact entities without review.
+For every source:
 
-## Step 5 — relationship candidates
-Generate candidate pairs from co-occurrence, CDR overlap, financial links, shared addresses, common organizations, common vehicles, event overlap and temporal proximity.
+```text
+source text
+   ↓
+language / text preprocessing
+   ↓
+NER + structured regex extraction
+   ↓
+PERSON / LOCATION / VEHICLE / PHONE / ORG / EMAIL / BANK
+   ↓
+normalization + conservative entity resolution
+```
 
-## Step 6 — ML score
-Train a classifier on labeled pairs. Keep the feature vector visible to investigators so a candidate link is explainable.
+Do not blindly copy the first phone/vehicle/organization from a multi-person document onto every person.
 
-## Step 7 — graph analytics
-Compute degree, betweenness, PageRank/eigenvector-like influence and communities. Label these as network-centrality measures, not criminality scores.
+## 4. Candidate relationship generation
 
-## Step 8 — stylometry
-Extract character/word n-gram style features. Compare documents only where there is a legitimate investigative basis. Report probability and uncertainty.
+For every pair of persons appearing in common evidence, calculate observable features such as:
 
-## Step 9 — integrity
-For each immutable event: canonical JSON → SHA-256(event + previous hash). Store both hashes. Export the chain for independent verification.
+- phone-call signals
+- transaction signals
+- meeting signals
+- co-occurrence count
+- source diversity
+- shared phone / vehicle / organization / location
 
-## Step 10 — regional language
-Store `original_text`, `language`, `translated_text` separately. Extract entities from the original where possible. Add Hindi NER and transliteration as a dedicated model stage.
+The system generates a **candidate relationship** rather than asserting a social or criminal relationship.
 
-## Step 11 — evaluation
-NER: precision/recall/F1.
-Relationship model: precision/recall/F1, PR-AUC, calibration.
-Stylometry: cross-validation, confusion matrix, false-positive analysis.
-Graph: query latency and correctness of provenance.
-Security: RLS tests, role tests, tamper-detection tests.
+## 5. ML relationship score
 
-## Step 12 — demo story
-Use one synthetic tip. Extract 4–8 entities. Expand the network using synthetic CDR/transaction/location records. Show 2–3 candidate links, each with a different reason. Show one hash-chain verification. Then show the investigator rejecting one weak link and confirming one after reviewing evidence.
+Train on the realistic synthetic `backend/data/relationships.csv`.
+
+The classifier predicts the likelihood that the observed pair of records represents a relationship signal.
+
+Training inputs intentionally exclude:
+
+- relationship type
+- relationship description
+- ground-truth confidence
+
+The score is displayed as an analytical confidence/lead score.
+
+## 6. Suspicious activity detection
+
+Use two layers:
+
+### Statistical/anomaly layer
+IsolationForest identifies unusual combinations of calls, call duration, transaction counts/value, meetings and evidence activity.
+
+### Explainable rule layer
+Flag patterns such as:
+
+- unusually frequent communications
+- repeated financial activity
+- high aggregate transaction value
+- repeated meetings
+- evidence spanning multiple source types
+- shared identifying attributes
+
+A suspicious-pattern flag is an investigation aid, not a finding of guilt.
+
+## 7. Network construction
+
+The main graph is investigator-driven:
+
+```text
+Search subject
+      ↓
+Select matching person
+      ↓
+Center selected person
+      ↓
+Show all connected candidate relationships
+      ↓
+Relationship type + score + evidence
+```
+
+The graph supports search, drag, pan, zoom, node hover and relationship inspection.
+
+## 8. Influential individuals
+
+Use NetworkX to calculate:
+
+- degree centrality
+- betweenness centrality
+- PageRank
+
+These are network-structure measures and should be described as such.
+
+## 9. Investigation analytics dashboard
+
+Expose:
+
+- sources processed
+- entities extracted
+- candidate links
+- suspicious-pattern signals
+- influential individuals
+- top relationship leads
+
+## 10. Integrity and auditability
+
+Hash original source documents and append important analytical actions to the audit log.
+
+A hash chain is tamper-evident, not automatically immutable.
+
+## 11. Regional languages
+
+Current pipeline stores `language` and preserves original text.
+
+Next language milestone:
+
+- Hindi NER
+- Punjabi NER
+- transliteration support
+- language-aware normalization
+
+Translated text must remain separate from original evidence.
+
+## 12. Evaluation
+
+Relationship model:
+
+- precision / recall / F1
+- ROC-AUC / PR-AUC
+- calibration
+- false-positive analysis
+
+Suspicious patterns:
+
+- detection precision on labeled synthetic scenarios
+- analyst-review usefulness
+
+Graph:
+
+- search latency
+- correct subject-to-neighbor retrieval
+- evidence provenance correctness
+
+Security:
+
+- RLS tests
+- authorization tests
+- audit-chain verification
+
+**Important:** evaluation on the supplied synthetic dataset is demonstration evidence, not evidence of real-world law-enforcement performance.

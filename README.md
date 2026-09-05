@@ -1,205 +1,215 @@
 # SIH 2026 — Problem Statement 26189: AI-Powered Criminal Network Analysis
 
-**Prototype name:** NyayaNet
+**Prototype:** NyayaNet
 
-This repository is a hackathon starter, not a production law-enforcement system. It demonstrates a privacy-aware workflow for authorized investigators: Supabase authentication → investigation workspace → document ingestion → NLP entity extraction → explainable candidate relationships → graph → append-only hash chain.
+NyayaNet is an authorized-investigator prototype for turning multiple intelligence sources into a structured, explainable criminal-network analysis workspace.
 
-## 1. Recommended architecture
+The intended workflow is:
 
 ```text
-React + Vite frontend
-        |
-        | Supabase Auth (publishable key)
-        v
-Supabase Auth + Postgres + Storage
-        ^
-        | RLS / authorized investigator access
-        |
-FastAPI backend (server-only service key)
-   |        |         |
-   |        |         +--> ML relationship scorer
-   |        +------------> NLP / NER / stylometry
-   +---------------------> hashing + audit log
+Investigator login
+      ↓
+Start new investigation / open ongoing / review closed
+      ↓
+Provide available intelligence sources
+  • FIR / police complaint
+  • police reports
+  • financial transaction records
+  • surveillance reports
+  • social-media intelligence
+  • criminal-history records
+      ↓
+Preserve source + hash
+      ↓
+NLP entity extraction + normalization
+  PERSON / LOCATION / VEHICLE / PHONE / ORG / EMAIL / BANK
+      ↓
+Candidate relationship generation
+      ↓
+ML relationship score
+      ↓
+Suspicious-pattern detection
+      ↓
+Graph analytics
+  • relationship map
+  • influential individuals
+  • suspicious activity signals
+      ↓
+Explainable investigator dashboard
 ```
 
-### Why separate frontend/backend?
-- React handles investigator UI and visualization.
-- Supabase handles identity, PostgreSQL, RLS and optional Storage.
-- FastAPI owns sensitive processing, model inference and controlled writes.
-- Never put the Supabase service-role key in React.
+## Existing project structure
 
-## 2. Features mapped to the problem statement
+The directory structure is intentionally unchanged. The main updates stay inside the existing `frontend/src`, `backend/app`, `backend/scripts`, `db`, `ml`, and `docs` files. The realistic India/NCR two-CSV dataset is stored in `backend/data/persons.csv` and `backend/data/relationships.csv`.
 
-1. FIR/intelligence ingestion.
-2. NLP entity extraction: people, organizations, places, phones, vehicles, emails.
-3. Entity normalization and deduplication (next milestone).
-4. Relationship graph with relation type, confidence and reason.
-5. Candidate relationship ML model.
-6. Stylometry baseline for comparing writing style.
-7. Tip-to-network: extract entities from a small tip and use them as graph seeds.
-8. Investigation ID generation in PostgreSQL.
-9. Regional-language UI/data pipeline (architecture-ready; add Indic NLP/translation models after English baseline works).
-10. Hash-chained links and audit events.
-11. Authorized-login gate using Supabase + profiles.is_authorized.
+## Architecture
 
-## 3. Important security design
+```text
+React + Vite
+      │
+      ├── Supabase Auth (publishable key only)
+      │
+      └── FastAPI API (server-only Supabase service key)
+                │
+                ├── PostgreSQL / RLS
+                ├── source document storage metadata + SHA-256 hashes
+                ├── spaCy + regex entity extraction
+                ├── relationship classifier
+                ├── IsolationForest suspicious-pattern detector
+                └── NetworkX centrality analytics
+```
 
-A SHA-256 hash makes tampering detectable; it does not magically make a database immutable. For the SIH demo, every link stores `previous_hash` + `link_hash`, producing a hash chain. For a real deployment, add an append-only/WORM evidence store or an external notarization service and retain independent audit copies.
+Never expose the Supabase service-role key in the browser.
 
-Do not describe an ML relationship score as proof of criminal association. UI wording should say **candidate link / analytical lead**, show the evidence/reason, and require human corroboration.
+## Investigator experience
 
-## 4. Supabase setup
+After login, an authorized investigator can start a new investigation or select an ongoing/closed investigation from the sidebar.
 
-1. Create a Supabase project.
-2. Open SQL Editor and run `db/schema.sql`.
-3. Create at least one user in Authentication, or sign up through the app.
-4. In `public.profiles`, set that user's `is_authorized = true` and appropriate role (`admin`, `supervisor`, `investigator`, or `analyst`).
-5. Copy Project URL and Publishable Key from the Supabase Connect/API area.
-6. Keep the Service Role Key server-only.
-7. Optional later: create a Storage bucket for source documents and protect it with RLS.
+Starting an investigation opens a source-intake workspace. The investigator provides the available FIR, police-report, financial, surveillance, social-media, and criminal-history information. At least one source is required; sources that do not exist for a case can remain empty.
 
-Current Supabase React guidance uses Vite + `@supabase/supabase-js` and environment variables such as `VITE_SUPABASE_URL` and `VITE_SUPABASE_PUBLISHABLE_KEY`. See the official docs linked in the project handoff.
+NyayaNet preserves the original source text, extracts entities, creates candidate relationships when people co-occur across evidence, scores those candidates with the trained model, and flags unusual activity combinations. The graph and analytics are restricted to the selected investigation.
 
-## 5. Backend setup — Windows/macOS/Linux
+## Machine-learning models
+
+### Relationship model
+
+The 600-person / 660-relationship synthetic dataset in `backend/data/relationships.csv` is used to train the relationship classifier. The model uses observable activity features including:
+
+- phone-call frequency
+- total call duration
+- transaction count
+- total transaction value
+- meeting count
+- evidence/activity co-occurrence
+- source diversity
+- shared phone / vehicle / organization / location signals when available during live analysis
+
+`relationship_type`, `relationship_description`, and `ground_truth_confidence` are **not** used as model inputs.
+
+The output is a **candidate relationship confidence**, not a probability of guilt.
+
+### Suspicious-pattern model
+
+An IsolationForest model learns unusual combinations of activity features and complements transparent rules such as unusually frequent calls, repeated transactions, high aggregate transaction value, repeated meetings, and cross-source activity.
+
+### Influence analysis
+
+NetworkX is used to calculate degree centrality, betweenness centrality, and PageRank. These are structural network measures. They are not criminality scores.
+
+## Train the models
+
+From the project root:
+
+```bash
+cd backend
+python scripts/train_relationship.py
+```
+
+This creates:
+
+```text
+ml/relationship_model.joblib
+ml/suspicious_pattern_model.joblib
+ml/relationship_features.json
+```
+
+The validation numbers printed by the training script are for the synthetic demo dataset only and must not be presented as real-world law-enforcement performance.
+
+## Run the backend
 
 ```bash
 cd backend
 python -m venv .venv
-# macOS/Linux
 source .venv/bin/activate
-# Windows PowerShell
-# .venv\\Scripts\\Activate.ps1
 pip install -r requirements.txt
 python -m spacy download en_core_web_sm
-cp .env.example .env
 ```
 
-Edit `.env` with your Supabase values.
+Put the Supabase URL, publishable key, and **server-only** service-role key in `backend/.env`.
 
-Run:
+Run on the port used by the current frontend setup:
+
 ```bash
-uvicorn app.main:app --reload --port 8000
+python -m uvicorn app.main:app --port 8080
 ```
 
-Test:
-```bash
-curl http://localhost:8000/health
+Health check:
+
+```text
+http://127.0.0.1:8080/health
 ```
 
-API docs: `http://localhost:8000/docs`
+API documentation:
 
-## 6. Frontend setup
+```text
+http://127.0.0.1:8080/docs
+```
+
+## Run the frontend
 
 ```bash
 cd frontend
 npm install
-cp .env.example .env
 npm run dev
 ```
 
-Open the Vite URL shown in the terminal, normally `http://localhost:5173`.
+Set:
 
-## 7. Demo flow
-
-1. Create/sign into an authorized account.
-2. Click **New investigation**.
-3. Paste the synthetic FIR from `backend/data/fir_demo.txt` into Tip-to-network analysis.
-4. Click **Extract entities**.
-5. Later, create entity rows from the extracted results and add relationship links through the backend.
-6. Refresh the graph.
-
-The current starter intentionally keeps evidence creation behind backend APIs rather than allowing unrestricted browser writes.
-
-## 8. Train the relationship model
-
-```bash
-cd backend
-python scripts/generate_synthetic.py
-python scripts/train_relationship.py
+```env
+VITE_API_URL=http://localhost:8080
 ```
 
-The synthetic model uses transparent features:
-- same organization
-- shared location
-- shared phone
-- number of co-occurrences
+in `frontend/.env`.
 
-For SIH, present the score as **relationship candidate confidence**, not guilt probability.
+## Supabase data model
 
-## 9. Train the stylometry baseline
+Core live tables:
 
-```bash
-cd ml
-python stylometry.py
-```
+- `profiles`
+- `investigations`
+- `documents`
+- `persons`
+- `person_relationships`
+- `analysis_runs`
+- `audit_log`
 
-This demo uses character n-grams + logistic regression. In the final project, evaluate with cross-validation and confidence thresholds, and explicitly state that stylometry is probabilistic and can be affected by language, editing, translation, shared templates, and short text.
+Legacy `entities` and `network_links` remain in the schema for compatibility with the original starter.
 
-## 10. NLP / NER training roadmap
+## Synthetic dataset
 
-Start with spaCy's pretrained English NER model. Then annotate a small synthetic/authorized corpus with labels such as:
+The supplied demonstration dataset contains:
 
-`PERSON`, `ORG`, `GPE`, `PHONE`, `VEHICLE`, `CASE_ID`, `ACCOUNT`, `DATE`, `EMAIL`.
+- 600 synthetic Indian persons
+- NCR-focused locations
+- names, phones, ages, vehicles, organizations, masked bank identifiers, crime-recorded fields, FIR text and language metadata
+- 660 synthetic relationship records
+- phone-call details, transaction details, meeting details
+- synthetic relationship-type labels such as Friend, Family, Business Associate, Partner, etc.
 
-Create train/dev/test splits. Train a custom NER component and measure precision, recall and F1 per entity class. For Indian regional languages, add language-specific models/tokenizers instead of translating everything blindly.
+Those relationship-type labels are demo reference labels. In a new investigation, NyayaNet should generate a **candidate relationship** from the observed evidence rather than inventing a social relationship that has not been supplied by an authoritative source.
 
-## 11. Datasets
+## Security / integrity framing
 
-The earlier image referenced in the conversation is not available as a file in this workspace, so this repository does **not** claim to contain those exact datasets. Put authorized datasets into `backend/data/` and create importers for each schema.
+SHA-256 content and hash-chain records make later changes detectable; hashing alone is not an immutable storage system. A production deployment would need an append-only/WORM or equivalent evidence-preservation layer and independent audit copies.
 
-Use synthetic data for the hackathon demo whenever real crime data is unavailable. Never use real victim/suspect PII in a public repository.
+The relationship model is an investigative lead generator. It must not be described as identifying criminals or proving guilt.
 
-Recommended synthetic tables:
-- persons.csv
-- organizations.csv
-- locations.csv
-- phone_records.csv
-- cdr.csv
-- transactions.csv
-- vehicles.csv
-- fir_documents.csv
-- surveillance_events.csv
-- social_posts.csv
+## Demo sequence for SIH
 
-## 12. Suggested database model
+1. Authorized investigator logs in.
+2. Start a new investigation.
+3. Enter a title, scope, and one or more intelligence sources.
+4. Run source analysis.
+5. Review extracted entities.
+6. Review candidate relationship scores.
+7. Review suspicious-activity signals.
+8. Inspect influential individuals.
+9. Search a person in the graph and inspect all connected relationships.
+10. Hover a node to inspect person metadata and click a relationship to inspect its evidence explanation.
+11. Close the investigation when the case is complete.
 
-`investigations` 1→N `documents`
+## Important prototype limitations
 
-`investigations` 1→N `entities`
+The NLP baseline is strongest on English and structured patterns. Hindi and Punjabi are preserved with language metadata, while dedicated Indic-language NER/transliteration models remain a future improvement.
 
-`entities` N↔N `entities` through `network_links`
-
-`documents` → extracted entities → candidate links → analyst verification → confirmed/ rejected status (add status fields in the next milestone).
-
-## 13. SIH demo screens
-
-- Login / authoritative access
-- Investigation dashboard
-- Create investigation / generated investigation ID
-- Data ingestion
-- NLP extraction panel
-- Entity profile
-- Network graph
-- Relationship explanation panel
-- Candidate-link review queue
-- Stylometry comparison
-- Evidence integrity / hash-chain audit
-- Regional language switch
-- Exportable investigation summary
-
-## 14. What to build next
-
-### Phase 1 — working MVP
-Auth → investigations → FIR upload/paste → NER → entities → manual links → graph.
-
-### Phase 2 — intelligence
-Candidate-link model → feature explanation → suspicious-pattern rules → centrality/community detection.
-
-### Phase 3 — integrity
-Hash chain → audit log → evidence storage → signed exports → independent timestamp/notarization.
-
-### Phase 4 — regional language
-Hindi first, then other required languages. Keep original text and extracted-language metadata; never overwrite original evidence with translated text.
-
-### Phase 5 — SIH polish
-Role-based dashboard, clean graph UX, search, filters, timeline, evidence provenance, evaluation metrics and a 3–5 minute demo scenario using only synthetic data.
+Entity resolution from free-form evidence is conservative: when a document mentions multiple people and several shared attributes, the system does not blindly assign the first phone/vehicle/organization to every person. This reduces false attribution.
