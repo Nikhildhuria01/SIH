@@ -109,6 +109,10 @@ export default function App() {
   const [graphLoading, setGraphLoading] = useState(false);
   const [selectedRelationship, setSelectedRelationship] = useState(null);
   const graphRef = useRef(null);
+  // Tracks whose session is currently active so the auth listener below can
+  // tell "same investigator, token silently refreshed" apart from "a
+  // different investigator actually signed in".
+  const sessionUserIdRef = useRef(null);
 
   useEffect(() => {
     let mounted = true;
@@ -121,6 +125,7 @@ export default function App() {
         } = await supabase.auth.getSession();
         if (!mounted) return;
         setSession(currentSession);
+        sessionUserIdRef.current = currentSession?.user?.id || null;
         if (currentSession) await loadProfile(currentSession.user.id);
       } catch (err) {
         if (mounted) setError(err.message || "Unable to initialize application.");
@@ -133,19 +138,41 @@ export default function App() {
 
     const {
       data: { subscription },
-    } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+    } = supabase.auth.onAuthStateChange((event, nextSession) => {
+      // Supabase re-validates the session (and re-fires SIGNED_IN /
+      // TOKEN_REFRESHED) whenever the browser tab regains focus. That is
+      // NOT a real login or logout — treating every event as one was why
+      // switching tabs reset the whole workspace and lost in-progress
+      // investigation work. Only a genuine sign-out, or a different
+      // investigator signing in, should clear state.
+      if (event === "SIGNED_OUT" || !nextSession) {
+        sessionUserIdRef.current = null;
+        setSession(null);
+        setProfile(null);
+        setInvestigations([]);
+        setSelected(null);
+        resetCaseState();
+        return;
+      }
+
+      const nextUserId = nextSession.user?.id || null;
+      const isDifferentUser = nextUserId !== sessionUserIdRef.current;
+      sessionUserIdRef.current = nextUserId;
+
+      // Always keep the session (and its access_token) current so API
+      // calls don't start using a stale token after a silent refresh.
       setSession(nextSession);
-      setProfile(null);
-      setInvestigations([]);
-      setSelected(null);
-      setAnalysis(null);
-      setAnalysisGraph({ nodes: [], links: [] });
-      setGraph({ nodes: [], links: [] });
-      setSelectedCriminal(null);
-      setCriminalSearch("");
-      if (nextSession) {
+
+      if (isDifferentUser) {
+        setProfile(null);
+        setInvestigations([]);
+        setSelected(null);
+        resetCaseState();
         setTimeout(() => loadProfile(nextSession.user.id), 0);
       }
+      // Same investigator, just a refreshed token: nothing else resets,
+      // so the active investigation, drafts, analysis and graph survive
+      // a tab switch untouched.
     });
 
     return () => {
@@ -695,6 +722,13 @@ export default function App() {
               <div className="stat-card"><span>CANDIDATE LINKS</span><strong>{analysis?.candidate_relationships?.length || 0}</strong><small>model-scored analytical leads</small></div>
               <div className="stat-card alert-stat"><span>SUSPICIOUS PATTERNS</span><strong>{analysis?.suspicious_patterns?.length || 0}</strong><small>requires investigator review</small></div>
             </section>
+
+            {analysis?.warnings?.length > 0 && (
+              <div className="error-box main-error analysis-warning">
+                <span>{analysis.warnings.join(" ")}</span>
+                <button onClick={() => setAnalysis((prev) => (prev ? { ...prev, warnings: [] } : prev))}>×</button>
+              </div>
+            )}
 
             <section className="panel source-panel">
               <div className="section-header">

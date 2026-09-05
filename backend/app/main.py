@@ -8,8 +8,9 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 
@@ -18,6 +19,15 @@ def extract_entities(text: str):
     from .nlp import extract_entities as _extract_entities
 
     return _extract_entities(text)
+
+
+def nlp_model_loaded() -> bool:
+    try:
+        from .nlp import NLP_MODEL_LOADED
+
+        return NLP_MODEL_LOADED
+    except Exception:
+        return False
 
 
 from .security import hash_link, sha256_json, utc_now
@@ -35,6 +45,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    # Any exception raised below (e.g. a lower-level httpx/httpcore/network
+    # failure while calling Supabase) would otherwise crash the ASGI
+    # connection before CORSMiddleware can attach CORS headers, which shows
+    # up in the browser as a misleading "blocked by CORS policy" error
+    # instead of the real cause. Catching it here still goes through
+    # CORSMiddleware, so the frontend gets a normal, readable error.
+    print(f"Unhandled exception on {request.method} {request.url.path}:", exc)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Unexpected server error: {exc}"},
+    )
+
 
 ROOT = Path(__file__).resolve().parents[2]
 MODEL_DIR = ROOT / "ml"
@@ -850,7 +876,7 @@ def persist_relationships(
             "total_transaction_amount": link.get("total_transaction_amount", 0),
             "meeting_count": link.get("meetings", 0),
             "relationship_label": (
-                "positive" if float(link.get("confidence") or 0) >= 0.5 else "candidate"
+                1 if float(link.get("confidence") or 0) >= 0.5 else 0
             ),
             "ground_truth_confidence": None,
             "model_confidence": link.get("confidence"),
@@ -912,6 +938,7 @@ def health():
         "supabase_configured": supabase is not None,
         "relationship_model_loaded": RELATIONSHIP_MODEL is not None,
         "anomaly_model_loaded": ANOMALY_MODEL is not None,
+        "nlp_model_loaded": nlp_model_loaded(),
         "model_loading": "lazy_on_first_analysis",
         "analysis_mode": "live-submitted-evidence",
     }
@@ -1021,7 +1048,13 @@ def analyze_sources(
                 "document_id": document["id"] if document else None,
             }
         )
-        persisted_documents.append({"document": document, "entities": entities})
+        persisted_documents.append(
+            {
+                "document": document,
+                "entities": entities,
+                "source_type": source.source_type.upper(),
+            }
+        )
 
     if not context_documents:
         raise HTTPException(
@@ -1036,6 +1069,28 @@ def analyze_sources(
     candidates = build_live_candidates(context_documents, person_profiles)
     graph_data = build_live_graph(investigation_id, person_profiles, candidates)
     analytics = live_graph_analytics(graph_data)
+
+    warnings: List[str] = []
+    if not person_profiles:
+        warnings.append(
+            "No person names could be identified in the submitted evidence, "
+            "so no relationships, network graph, or suspicious-pattern "
+            "signals were generated. Try including full names in the "
+            "source text."
+        )
+    elif len(person_profiles) == 1:
+        warnings.append(
+            "Only one person was identified across the submitted evidence, "
+            "so no candidate relationships could be generated yet. Add "
+            "evidence that mentions at least two people together."
+        )
+    if not nlp_model_loaded():
+        warnings.append(
+            "The spaCy English NLP model is not installed on the server, "
+            "so entity extraction is running in a reduced-accuracy fallback "
+            "mode. Run 'python -m spacy download en_core_web_sm' in the "
+            "backend virtualenv and restart the API for full accuracy."
+        )
 
     suspicious_patterns = [
         {
@@ -1146,6 +1201,7 @@ def analyze_sources(
         "influential_persons": analytics.get("influential_persons", []),
         "community_count": analytics.get("community_count", 0),
         "graph": graph_data,
+        "warnings": warnings,
         "message": "Analysis completed from submitted investigation evidence only. Scores are analytical leads, not proof of criminality.",
     }
 
