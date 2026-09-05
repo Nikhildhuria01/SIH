@@ -1,0 +1,15 @@
+{
+  "feature_names": [
+    "log_calls",
+    "log_call_duration",
+    "log_transactions",
+    "log_transaction_amount",
+    "log_meetings",
+    "log_co_occurrences",
+    "source_diversity",
+    "shared_phone",
+    "shared_vehicle",
+    "shared_org",
+    "shared_location"
+  ]
+}
