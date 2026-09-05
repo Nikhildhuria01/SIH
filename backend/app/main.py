@@ -91,6 +91,10 @@ class InvestigationAnalyzeRequest(BaseModel):
     sources: List[SourceInput] = Field(default_factory=list)
 
 
+class SourceSaveRequest(BaseModel):
+    sources: List[SourceInput] = Field(default_factory=list)
+
+
 class DocumentIn(BaseModel):
     investigation_id: str
     source_type: str
@@ -1385,6 +1389,70 @@ def persist_relationships(
 
 
 # -----------------------------------------------------------------------------
+# Persistent investigation workspace
+# -----------------------------------------------------------------------------
+
+
+def ensure_investigation_access(
+    investigation_id: str,
+    user_id: str,
+) -> Dict[str, Any]:
+    result = (
+        supabase.table("investigations")
+        .select("*")
+        .eq("id", investigation_id)
+        .eq("created_by", user_id)
+        .limit(1)
+        .execute()
+    )
+    if not result.data:
+        raise HTTPException(
+            status_code=404,
+            detail="Investigation not found for this investigator",
+        )
+    return result.data[0]
+
+
+def persist_source_drafts(
+    investigation_id: str,
+    sources: List[SourceInput],
+) -> List[Dict[str, Any]]:
+    saved: List[Dict[str, Any]] = []
+
+    for source in sources:
+        source_type = source.source_type.upper().strip()
+        content = source.content or ""
+        title = source.title or source_type.replace("_", " ").title()
+        language = source.language or "en"
+
+        if not source_type:
+            continue
+
+        payload = {
+            "investigation_id": investigation_id,
+            "source_type": source_type,
+            "title": title,
+            "content": content,
+            "language": language,
+            "updated_at": utc_now(),
+        }
+
+        result = (
+            supabase.table("investigation_sources")
+            .upsert(
+                payload,
+                on_conflict="investigation_id,source_type",
+            )
+            .execute()
+        )
+
+        if result.data:
+            saved.append(result.data[0])
+
+    return saved
+
+
+# -----------------------------------------------------------------------------
 # Core endpoints
 # -----------------------------------------------------------------------------
 
@@ -1424,6 +1492,45 @@ def create_investigation(
     return result.data[0]
 
 
+@app.get("/api/investigations/{investigation_id}/sources")
+def get_investigation_sources(
+    investigation_id: str,
+    authorization: Optional[str] = Header(None),
+):
+    user_id = require_user(authorization)
+    ensure_investigation_access(investigation_id, user_id)
+
+    result = (
+        supabase.table("investigation_sources")
+        .select("*")
+        .eq("investigation_id", investigation_id)
+        .order("source_type")
+        .execute()
+    )
+    return result.data or []
+
+
+@app.put("/api/investigations/{investigation_id}/sources")
+def save_investigation_sources(
+    investigation_id: str,
+    body: SourceSaveRequest,
+    authorization: Optional[str] = Header(None),
+):
+    user_id = require_user(authorization)
+    ensure_investigation_access(investigation_id, user_id)
+
+    saved = persist_source_drafts(
+        investigation_id,
+        body.sources,
+    )
+
+    return {
+        "investigation_id": investigation_id,
+        "sources": saved,
+        "saved_at": utc_now(),
+    }
+
+
 @app.post("/api/investigations/{investigation_id}/close")
 def close_investigation(
     investigation_id: str,
@@ -1448,8 +1555,13 @@ def analyze_sources(
     authorization: Optional[str] = Header(None),
 ):
     user_id = require_user(authorization)
+    ensure_investigation_access(investigation_id, user_id)
     if not body.sources:
         raise HTTPException(400, "Provide at least one intelligence source")
+
+    # Save the exact inputs first. This protects the investigator's work even
+    # if a later analysis stage fails.
+    persist_source_drafts(investigation_id, body.sources)
 
     context_documents: List[Dict[str, Any]] = []
     persisted_documents: List[Dict[str, Any]] = []
@@ -1539,7 +1651,8 @@ def analyze_sources(
             "person_b_id": c["person_b_key"],
             "confidence": c["model_confidence"],
             "reason": c["reason"],
-            "relationship_type": "Potential Relationship",
+            "relationship_type": c.get("relationship_type")
+            or "Evidence-linked Association",
             "source_diversity": c["source_diversity"],
             "calls": c["phone_call_count"],
             "transactions": c["transaction_count"],
@@ -1573,8 +1686,20 @@ def analyze_sources(
                 "summary": {
                     "entity_counts": dict(entity_counts),
                     "top_relationships": top_relationships,
+                    "suspicious_patterns": suspicious_patterns[:20],
                     "influential_persons": analytics.get("influential_persons", []),
+                    "community_count": analytics.get("community_count", 0),
+                    "graph": graph_data,
+                    "source_types": [d["source_type"] for d in context_documents],
                     "analysis_mode": "submitted_evidence_only",
+                    "summary_text": (
+                        f"Analyzed {len(context_documents)} intelligence source(s), "
+                        f"identified {len(person_profiles)} person(s) and "
+                        f"{len(candidates)} evidence-backed relationship(s). "
+                        f"{len(suspicious_patterns)} relationship(s) surfaced "
+                        "suspicious activity indicators."
+                    ),
+                    "analyzed_at": utc_now(),
                 },
             }
         ).execute()
@@ -1639,176 +1764,87 @@ def investigation_analysis(
     investigation_id: str,
     authorization: Optional[str] = Header(None),
 ):
-    require_user(authorization)
-    # Rebuild a persisted-case view when reopening an investigation. This is
-    # live investigation data, not the ML training CSVs.
-    persons = (
-        supabase.table("persons")
+    user_id = require_user(authorization)
+    ensure_investigation_access(investigation_id, user_id)
+
+    source_rows = (
+        supabase.table("investigation_sources")
         .select("*")
         .eq("investigation_id", investigation_id)
-        .execute()
-        .data
-        or []
-    )
-    relationships = (
-        supabase.table("person_relationships")
-        .select("*")
-        .eq("investigation_id", investigation_id)
+        .order("source_type")
         .execute()
         .data
         or []
     )
 
-    graph_data = {
-        "nodes": [
-            {
-                "id": p["person_id"],
-                "name": p["name"],
-                "type": "PERSON",
-                "is_center": False,
-                "age": p.get("age"),
-                "location": p.get("location"),
-                "phone_num": p.get("phone_num"),
-                "vehicle_num": p.get("vehicle_num"),
-                "org": p.get("org"),
-                "bank_account": p.get("bank_account"),
-                "crime_recorded": p.get("crime_recorded"),
-                "fir_language": p.get("fir_language"),
-            }
-            for p in persons
-        ],
-        "links": [
-            {
-                "source": r["person_a_id"],
-                "target": r["person_b_id"],
-                "relationship_type": r.get("relationship_type")
-                or "Potential Relationship",
-                "relationship_description": r.get("relationship_description"),
-                "confidence": r.get("model_confidence"),
-                "reason": r.get("reason"),
-                "calls": r.get("phone_call_count", 0),
-                "transactions": r.get("transaction_count", 0),
-                "meetings": r.get("meeting_count", 0),
-                "total_transaction_amount": r.get("total_transaction_amount", 0),
-                "suspicious": r.get("suspicious", False),
-            }
-            for r in relationships
-        ],
-    }
-    analytics = live_graph_analytics(graph_data)
-    return {
-        "investigation_id": investigation_id,
-        "analysis_mode": "persisted_current_investigation",
-        "graph": graph_data,
-        **analytics,
-    }
-
-
-# -----------------------------------------------------------------------------
-# Legacy-compatible endpoints
-# -----------------------------------------------------------------------------
-
-
-@app.post("/api/nlp/extract")
-def nlp_extract(
-    body: DocumentIn,
-    authorization: Optional[str] = Header(None),
-):
-    require_user(authorization)
-    entities = extract_entities(body.content)
-    content_hash = sha256_json(
-        {"content": body.content, "source_type": body.source_type}
-    )
-    document_row = {
-        "investigation_id": body.investigation_id,
-        "source_type": body.source_type,
-        "title": body.title,
-        "content": body.content,
-        "language": body.language,
-        "content_hash": content_hash,
-        "extracted_entities": entities,
-    }
-    document = supabase.table("documents").insert(document_row).execute()
-    return {
-        "entities": entities,
-        "document": document.data[0] if document.data else None,
-    }
-
-
-@app.post("/api/documents")
-def create_document(
-    body: DocumentIn,
-    authorization: Optional[str] = Header(None),
-):
-    return nlp_extract(body, authorization)
-
-
-@app.post("/api/links")
-def create_link(
-    body: LinkIn,
-    authorization: Optional[str] = Header(None),
-):
-    require_user(authorization)
-    last = (
-        supabase.table("network_links")
-        .select("link_hash")
-        .eq("investigation_id", body.investigation_id)
+    latest_run = (
+        supabase.table("analysis_runs")
+        .select("*")
+        .eq("investigation_id", investigation_id)
         .order("created_at", desc=True)
         .limit(1)
         .execute()
     )
-    previous = last.data[0]["link_hash"] if last.data else ""
-    payload = body.model_dump()
-    link_hash_value = hash_link(payload, previous)
-    row = {
-        **payload,
-        "link_hash": link_hash_value,
-        "previous_hash": previous,
-        "created_at": utc_now(),
+
+    if not latest_run.data:
+        return {
+            "investigation_id": investigation_id,
+            "analysis_mode": "submitted_evidence_only",
+            "sources": [
+                {
+                    "source_type": s["source_type"],
+                    "title": s.get("title"),
+                    "entity_count": None,
+                }
+                for s in source_rows
+                if (s.get("content") or "").strip()
+            ],
+            "source_drafts": source_rows,
+            "entity_counts": {},
+            "candidate_relationships": [],
+            "suspicious_patterns": [],
+            "influential_persons": [],
+            "community_count": 0,
+            "graph": {"nodes": [], "links": []},
+            "summary_text": "No analysis has been run for this investigation yet.",
+            "analysis_run": None,
+        }
+
+    run = latest_run.data[0]
+    summary = run.get("summary") or {}
+    graph_data = summary.get("graph") or {"nodes": [], "links": []}
+
+    return {
+        "investigation_id": investigation_id,
+        "analysis_mode": summary.get("analysis_mode", "submitted_evidence_only"),
+        "sources": [
+            {
+                "source_type": s["source_type"],
+                "title": s.get("title"),
+                "entity_count": None,
+            }
+            for s in source_rows
+            if (s.get("content") or "").strip()
+        ],
+        "source_drafts": source_rows,
+        "entity_counts": summary.get("entity_counts", {}),
+        "candidate_relationships": summary.get("top_relationships", []),
+        "suspicious_patterns": summary.get("suspicious_patterns", []),
+        "influential_persons": summary.get("influential_persons", []),
+        "community_count": summary.get("community_count", 0),
+        "graph": graph_data,
+        "summary_text": summary.get(
+            "summary_text", "Persisted investigation analysis loaded."
+        ),
+        "analysis_run": {
+            "id": run.get("id"),
+            "created_at": run.get("created_at"),
+            "sources_processed": run.get("sources_processed", 0),
+            "entities_extracted": run.get("entities_extracted", 0),
+            "candidate_links": run.get("candidate_links", 0),
+            "suspicious_links": run.get("suspicious_links", 0),
+        },
     }
-    result = supabase.table("network_links").insert(row).execute()
-    return result.data[0]
-
-
-@app.get("/api/investigations/{investigation_id}/persons")
-def get_persons(
-    investigation_id: str,
-    authorization: Optional[str] = Header(None),
-):
-    require_user(authorization)
-    result = (
-        supabase.table("persons")
-        .select("*")
-        .eq("investigation_id", investigation_id)
-        .order("name")
-        .execute()
-    )
-    return result.data or []
-
-
-@app.get("/api/investigations/{investigation_id}/relationships")
-def get_relationships(
-    investigation_id: str,
-    authorization: Optional[str] = Header(None),
-):
-    require_user(authorization)
-    result = (
-        supabase.table("person_relationships")
-        .select("*")
-        .eq("investigation_id", investigation_id)
-        .execute()
-    )
-    return result.data or []
-
-
-@app.get("/api/investigations/{investigation_id}/graph")
-def graph(
-    investigation_id: str,
-    authorization: Optional[str] = Header(None),
-):
-    require_user(authorization)
-    analysis = investigation_analysis(investigation_id, authorization)
-    return analysis["graph"]
 
 
 @app.get("/api/investigations/{investigation_id}/persons/search")

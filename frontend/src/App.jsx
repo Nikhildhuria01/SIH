@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "./lib/supabase";
 import ForceGraph2D from "react-force-graph-2d";
 
-const API = import.meta.env.VITE_API_URL || "http://localhost:8080";
+const API = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
 const SOURCE_TYPES = [
   { key: "FIR", label: "FIR / Police Complaint", icon: "📄", hint: "FIR narratives, complaint text, witness statements" },
@@ -91,6 +91,7 @@ export default function App() {
   const [sourceLanguage, setSourceLanguage] = useState("en");
   const [analysisLoading, setAnalysisLoading] = useState(false);
   const [analysis, setAnalysis] = useState(null);
+  const [sourceSaveStatus, setSourceSaveStatus] = useState("Saved");
 
   const [firText, setFirText] = useState("");
   const [firEntities, setFirEntities] = useState([]);
@@ -111,6 +112,8 @@ export default function App() {
   const [hoveredNode, setHoveredNode] = useState(null);
   const [hoveredLink, setHoveredLink] = useState(null);
   const graphRef = useRef(null);
+  const sourceSaveTimerRef = useRef(null);
+  const restoringCaseRef = useRef(false);
   // Tracks whose session is currently active so the auth listener below can
   // tell "same investigator, token silently refreshed" apart from "a
   // different investigator actually signed in".
@@ -305,6 +308,8 @@ export default function App() {
         language: source.key === "FIR" ? newFirLanguage : "en",
       }));
 
+      await saveSourcesForInvestigation(created.id, newSources, newFirLanguage);
+
       const result = await apiFetch(
         `/api/investigations/${created.id}/analyze-sources`,
         { method: "POST", body: JSON.stringify({ sources }) },
@@ -337,6 +342,8 @@ export default function App() {
         content: sourceDrafts[source.key],
         language: source.key === "FIR" ? sourceLanguage : "en",
       }));
+      await saveSourcesForInvestigation(selected.id, sourceDrafts, sourceLanguage);
+
       const result = await apiFetch(
         `/api/investigations/${selected.id}/analyze-sources`,
         { method: "POST", body: JSON.stringify({ sources }) },
@@ -345,7 +352,6 @@ export default function App() {
       setAnalysis(result);
       setAnalysisGraph(result.graph || { nodes: [], links: [] });
       setGraph(result.graph || { nodes: [], links: [] });
-      setSourceDrafts({ ...EMPTY_SOURCE });
       await loadInvestigations();
     } catch (err) {
       setError(err.message || "Source analysis failed.");
@@ -485,41 +491,97 @@ export default function App() {
 
     let cancelled = false;
 
-    async function loadPersistedAnalysis() {
+    async function loadPersistedCase() {
+      restoringCaseRef.current = true;
+      setSourceSaveStatus("Loading saved case…");
+
       try {
-        const result = await apiFetch(
-          `/api/investigations/${selected.id}/analysis`,
-          {},
-          session
-        );
+        const [sourceResult, analysisResult] = await Promise.all([
+          apiFetch(`/api/investigations/${selected.id}/sources`, {}, session),
+          apiFetch(`/api/investigations/${selected.id}/analysis`, {}, session),
+        ]);
+
         if (cancelled) return;
 
-        setAnalysisGraph(result.graph || { nodes: [], links: [] });
-        setGraph(result.graph || { nodes: [], links: [] });
+        const drafts = { ...EMPTY_SOURCE };
+        let firLanguage = "en";
+
+        (sourceResult?.sources || []).forEach((source) => {
+          if (Object.prototype.hasOwnProperty.call(drafts, source.source_type)) {
+            drafts[source.source_type] = source.content || "";
+          }
+          if (source.source_type === "FIR" && source.language) {
+            firLanguage = source.language;
+          }
+        });
+
+        setSourceDrafts(drafts);
+        setSourceLanguage(firLanguage);
+
+        const persistedGraph = analysisResult?.graph || { nodes: [], links: [] };
+        setAnalysisGraph(persistedGraph);
+        setGraph(persistedGraph);
         setSelectedCriminal(null);
         setSelectedRelationship(null);
 
-        setAnalysis((previous) => ({
-          ...(previous || {}),
-          ...result,
-          graph: result.graph || { nodes: [], links: [] },
-        }));
+        setAnalysis(
+          analysisResult?.analysis_run ||
+          persistedGraph.nodes.length ||
+          persistedGraph.links.length
+            ? analysisResult
+            : null
+        );
+        setSourceSaveStatus("Saved");
       } catch (err) {
         if (!cancelled) {
-          // A brand-new investigation may have no analysis yet.
-          if (!String(err.message || '').includes('404')) {
-            console.warn('Persisted analysis load skipped:', err.message);
-          }
+          console.warn("Saved case load failed:", err.message);
+          setSourceSaveStatus("Unable to load saved case");
         }
+      } finally {
+        restoringCaseRef.current = false;
       }
     }
 
-    loadPersistedAnalysis();
+    loadPersistedCase();
+
+    return () => { cancelled = true; };
+  }, [selected?.id, session?.access_token]);
+
+  async function saveSourcesForInvestigation(investigationId, drafts = sourceDrafts, firLanguage = sourceLanguage) {
+    if (!investigationId || !session?.access_token) return;
+
+    const sources = SOURCE_TYPES.map((source) => ({
+      source_type: source.key,
+      title: source.label,
+      content: drafts[source.key] || "",
+      language: source.key === "FIR" ? firLanguage : "en",
+    }));
+
+    setSourceSaveStatus("Saving…");
+    await apiFetch(
+      `/api/investigations/${investigationId}/sources`,
+      { method: "PUT", body: JSON.stringify({ sources }) },
+      session
+    );
+    setSourceSaveStatus("Saved");
+  }
+
+  useEffect(() => {
+    if (!selected?.id || !session?.access_token || restoringCaseRef.current) return;
+
+    if (sourceSaveTimerRef.current) clearTimeout(sourceSaveTimerRef.current);
+
+    sourceSaveTimerRef.current = setTimeout(() => {
+      saveSourcesForInvestigation(selected.id, sourceDrafts, sourceLanguage).catch((err) => {
+        console.warn("Source autosave failed:", err.message);
+        setSourceSaveStatus("Save failed");
+      });
+    }, 700);
 
     return () => {
-      cancelled = true;
+      if (sourceSaveTimerRef.current) clearTimeout(sourceSaveTimerRef.current);
     };
-  }, [selected?.id, session?.access_token]);
+  }, [selected?.id, session?.access_token, sourceDrafts, sourceLanguage]);
 
   useEffect(() => {
     const graphApi = graphRef.current;
@@ -549,6 +611,13 @@ export default function App() {
   }
 
   async function signOut() {
+    try {
+      if (selected?.id && session?.access_token) {
+        await saveSourcesForInvestigation(selected.id, sourceDrafts, sourceLanguage);
+      }
+    } catch (err) {
+      console.warn("Final save before sign out failed:", err.message);
+    }
     await supabase.auth.signOut();
     resetCaseState();
     setSession(null);
@@ -779,7 +848,7 @@ export default function App() {
                 <button className="primary-button" onClick={analyzeSourcesForExistingCase} disabled={analysisLoading}>
                   {analysisLoading ? "Running Intelligence Analysis…" : "Run Intelligence Analysis"}
                 </button>
-                <span>At least one source is required. Add only the sources available for the case.</span>
+                <span>{sourceSaveStatus} · At least one source is required. Add only the sources available for the case.</span>
               </div>
             </section>
 
@@ -812,6 +881,29 @@ export default function App() {
                 </div>
               </div>
             </section>
+
+            {analysis && (
+              <section className="panel investigation-summary-panel">
+                <div className="section-header">
+                  <div>
+                    <div className="eyebrow">CASE SUMMARY</div>
+                    <h2>Investigation Overview</h2>
+                    <p>{analysis.summary_text || "Persistent analytical snapshot for this investigation."}</p>
+                  </div>
+                  <div className="summary-run-badge">
+                    {analysis.analysis_run?.created_at
+                      ? `Last analyzed ${new Date(analysis.analysis_run.created_at).toLocaleString()}`
+                      : "Saved case data"}
+                  </div>
+                </div>
+                <div className="summary-grid">
+                  <div className="summary-stat"><span>PEOPLE</span><strong>{analysis.graph?.nodes?.length || 0}</strong></div>
+                  <div className="summary-stat"><span>RELATIONSHIPS</span><strong>{analysis.graph?.links?.length || 0}</strong></div>
+                  <div className="summary-stat"><span>COMMUNITIES</span><strong>{analysis.community_count || 0}</strong></div>
+                  <div className="summary-stat summary-alert"><span>SUSPICIOUS SIGNALS</span><strong>{analysis.suspicious_patterns?.length || 0}</strong></div>
+                </div>
+              </section>
+            )}
 
             <section className="panel network-workspace">
               <div className="section-header">
