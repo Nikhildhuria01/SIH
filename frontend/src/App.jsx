@@ -108,6 +108,8 @@ export default function App() {
   const [graph, setGraph] = useState({ nodes: [], links: [] });
   const [graphLoading, setGraphLoading] = useState(false);
   const [selectedRelationship, setSelectedRelationship] = useState(null);
+  const [hoveredNode, setHoveredNode] = useState(null);
+  const [hoveredLink, setHoveredLink] = useState(null);
   const graphRef = useRef(null);
   // Tracks whose session is currently active so the auth listener below can
   // tell "same investigator, token silently refreshed" apart from "a
@@ -254,6 +256,8 @@ export default function App() {
     setShowSearchResults(false);
     setSelectedCriminal(null);
     setSelectedRelationship(null);
+    setHoveredNode(null);
+    setHoveredLink(null);
     setAnalysisGraph({ nodes: [], links: [] });
     setGraph({ nodes: [], links: [] });
     setSourceDrafts({ ...EMPTY_SOURCE });
@@ -520,12 +524,19 @@ export default function App() {
   useEffect(() => {
     const graphApi = graphRef.current;
     if (!graphApi) return;
+
     const charge = graphApi.d3Force("charge");
     const link = graphApi.d3Force("link");
-    if (charge?.strength) charge.strength(-900);
-    if (link?.distance) link.distance(230);
-    const simulation = graphApi.d3Force("center");
-    if (simulation?.strength) simulation.strength(0.08);
+    const center = graphApi.d3Force("center");
+
+    // Large separation between people + gentle centering.
+    // This is deliberately much looser than the default force layout.
+    charge?.strength?.(-2600);
+    charge?.distanceMax?.(1400);
+    link?.distance?.(430);
+    link?.strength?.(0.65);
+    center?.strength?.(0.08);
+
     graphApi.d3ReheatSimulation?.();
   }, [graph.nodes.length, graph.links.length]);
 
@@ -866,17 +877,27 @@ export default function App() {
                         graphData={graph}
                         backgroundColor="#06101f"
                         enableNodeDrag
-                        cooldownTicks={220}
-                        d3AlphaDecay={0.018}
-                        d3VelocityDecay={0.28}
-                        nodeRelSize={7}
+                        cooldownTicks={420}
+                        warmupTicks={120}
+                        d3AlphaDecay={0.009}
+                        d3VelocityDecay={0.18}
                         nodeAutoColorBy="is_center"
+                        nodeRelSize={7}
+
+                        // Node hover uses the library's cursor-following tooltip.
+                        // No fixed-position detail card is used.
                         nodeLabel={(node) => `
                           <div class="node-tooltip">
                             <div class="node-tooltip-head">
-                              <div class="node-tooltip-avatar">${escapeHtml(initials(node.name))}</div>
-                              <div><strong>${escapeHtml(node.name || "Unknown")}</strong><span>${escapeHtml(node.id || "")}</span></div>
+                              <div class="node-tooltip-avatar">
+                                ${escapeHtml(initials(node.name))}
+                              </div>
+                              <div>
+                                <strong>${escapeHtml(node.name || "Unknown")}</strong>
+                                <span>Person</span>
+                              </div>
                             </div>
+
                             <div class="node-tooltip-grid">
                               <div><span>AGE</span><b>${escapeHtml(node.age ?? "—")}</b></div>
                               <div><span>LOCATION</span><b>${escapeHtml(node.location || "—")}</b></div>
@@ -884,63 +905,203 @@ export default function App() {
                               <div><span>VEHICLE</span><b>${escapeHtml(node.vehicle_num || "—")}</b></div>
                               <div><span>ORGANIZATION</span><b>${escapeHtml(node.org || "—")}</b></div>
                               <div><span>CRIME RECORDED</span><b>${escapeHtml(node.crime_recorded || "—")}</b></div>
+                              <div><span>SOURCES</span><b>${escapeHtml((node.source_types || []).join(" • ") || "—")}</b></div>
                             </div>
-                          </div>`}
-                        linkLabel={(link) => `${link.relationship_type || "Potential Relationship"}${link.confidence != null ? ` • ${Math.round(link.confidence * 100)}%` : ""}`}
-                        linkDirectionalArrowLength={6}
-                        linkDirectionalArrowRelPos={1}
-                        linkCurvature={0.08}
-                        linkWidth={(link) => Math.max(1.5, 1 + Number(link.confidence || 0) * 2)}
-                        linkColor={() => "rgba(71, 170, 255, 0.72)"}
-                        nodeCanvasObject={(node, ctx, scale) => {
-                          const radius = node.is_center ? 13 : 9;
+                          </div>
+                        `}
+
+                        // Relationship hover also follows the cursor.
+                        linkLabel={(link) => `
+                          <div class="edge-tooltip">
+                            <strong>
+                              ${escapeHtml(
+                                link.relationship_type ||
+                                "Evidence-linked Association"
+                              )}
+                            </strong>
+                            ${
+                              link.confidence != null
+                                ? `<span>Potential score: ${Math.round(
+                                    link.confidence * 100
+                                  )}%</span>`
+                                : ""
+                            }
+                            <p>
+                              ${escapeHtml(
+                                link.relationship_description ||
+                                link.reason ||
+                                "Evidence-backed relationship."
+                              )}
+                            </p>
+                            <div class="edge-evidence">
+                              ${
+                                Number(link.calls || 0) > 0
+                                  ? `<span>☎ ${Number(link.calls)} call(s)</span>`
+                                  : ""
+                              }
+                              ${
+                                Number(link.transactions || 0) > 0
+                                  ? `<span>₹ ${Number(link.transactions)} transaction(s)</span>`
+                                  : ""
+                              }
+                              ${
+                                Number(link.meetings || 0) > 0
+                                  ? `<span>● ${Number(link.meetings)} meeting(s)</span>`
+                                  : ""
+                              }
+                            </div>
+                          </div>
+                        `}
+
+                        nodeCanvasObject={(node, ctx, globalScale) => {
+                          const isHovered = hoveredNode === node;
+                          const isCenter = Boolean(node.is_center);
+
+                          const radius = isHovered ? 17 : 13;
+
+                          ctx.save();
+
+                          if (isHovered || isCenter) {
+                            ctx.beginPath();
+                            ctx.arc(
+                              node.x,
+                              node.y,
+                              radius + 8,
+                              0,
+                              Math.PI * 2
+                            );
+                            ctx.fillStyle = isCenter
+                              ? "rgba(46, 232, 137, 0.14)"
+                              : "rgba(74, 165, 255, 0.12)";
+                            ctx.fill();
+                          }
+
                           ctx.beginPath();
-                          ctx.arc(node.x, node.y, radius, 0, Math.PI * 2);
-                          ctx.fillStyle = node.is_center ? "#083d2d" : "#0f2542";
+                          ctx.arc(
+                            node.x,
+                            node.y,
+                            radius,
+                            0,
+                            Math.PI * 2
+                          );
+                          ctx.fillStyle = isCenter
+                            ? "#073a2d"
+                            : "#102944";
                           ctx.fill();
-                          ctx.lineWidth = node.is_center ? 3 : 2;
-                          ctx.strokeStyle = node.is_center ? "#2ee889" : "#4aa5ff";
+
+                          ctx.strokeStyle = isCenter
+                            ? "#2ee889"
+                            : isHovered
+                              ? "#b7dcff"
+                              : "#4aa5ff";
+                          ctx.lineWidth = isHovered ? 3 : 2;
                           ctx.stroke();
 
-                          const label = node.name || "Unknown";
-                          const fontSize = Math.max(10, 12 / scale);
-                          ctx.font = `600 ${fontSize}px Inter, system-ui, sans-serif`;
-                          ctx.textAlign = "center";
-                          ctx.fillStyle = "#e9f1ff";
-                          ctx.fillText(label, node.x, node.y + radius + fontSize + 4);
-
-                          ctx.font = `500 ${Math.max(8, fontSize * 0.82)}px Inter, system-ui, sans-serif`;
-                          ctx.fillStyle = "#7f96b5";
-                          ctx.fillText(node.id || "", node.x, node.y + radius + fontSize * 2.25);
-                        }}
-                        linkCanvasObjectMode={() => "after"}
-                        linkCanvasObject={(link, ctx, scale) => {
-                          const source = link.source;
-                          const target = link.target;
-                          if (!source || !target || typeof source.x !== "number" || typeof target.x !== "number") return;
-                          const x = (source.x + target.x) / 2;
-                          const y = (source.y + target.y) / 2;
-                          const label = link.relationship_type || "Relationship";
-                          const confidence = link.confidence != null ? ` ${Math.round(link.confidence * 100)}%` : "";
-                          const text = `${label}${confidence}`;
-                          const fontSize = Math.max(8, 10.5 / scale);
-                          ctx.font = `600 ${fontSize}px Inter, system-ui, sans-serif`;
-                          const width = ctx.measureText(text).width + 10;
-                          ctx.fillStyle = "rgba(4, 13, 25, 0.90)";
-                          ctx.fillRect(x - width / 2, y - fontSize / 2 - 4, width, fontSize + 8);
-                          ctx.fillStyle = "#b8d8ff";
+                          // Initials inside the person node.
+                          ctx.font =
+                            "700 11px Inter, system-ui, sans-serif";
+                          ctx.fillStyle = "#f5f9ff";
                           ctx.textAlign = "center";
                           ctx.textBaseline = "middle";
-                          ctx.fillText(text, x, y);
+                          ctx.fillText(
+                            initials(node.name),
+                            node.x,
+                            node.y
+                          );
+
+                          // Full PERSON NAME below the node.
+                          // No IDs, relationship types, locations, or other
+                          // entities are rendered on the graph itself.
+                          const name = node.name || "Unknown";
+                          const nameSize = Math.max(
+                            10,
+                            Math.min(
+                              14,
+                              12 / Math.max(globalScale, 0.75)
+                            )
+                          );
+
+                          ctx.font =
+                            `600 ${nameSize}px Inter, system-ui, sans-serif`;
+
+                          const textWidth =
+                            ctx.measureText(name).width;
+
+                          const pillWidth = textWidth + 14;
+                          const pillHeight = nameSize + 10;
+                          const pillY =
+                            node.y + radius + 7;
+
+                          ctx.fillStyle =
+                            "rgba(4, 13, 25, 0.86)";
+
+                          ctx.beginPath();
+                          ctx.roundRect(
+                            node.x - pillWidth / 2,
+                            pillY,
+                            pillWidth,
+                            pillHeight,
+                            6
+                          );
+                          ctx.fill();
+
+                          ctx.fillStyle = "#eef6ff";
+                          ctx.textAlign = "center";
+                          ctx.textBaseline = "middle";
+
+                          ctx.fillText(
+                            name,
+                            node.x,
+                            pillY + pillHeight / 2
+                          );
+
+                          ctx.restore();
                         }}
+
+                        linkWidth={(link) =>
+                          hoveredLink === link
+                            ? 3.5
+                            : Math.max(
+                                1.5,
+                                1 + Number(link.confidence || 0)
+                              )
+                        }
+
+                        linkColor={(link) =>
+                          hoveredLink === link
+                            ? "#71baff"
+                            : "rgba(65, 155, 235, 0.48)"
+                        }
+
+                        linkDirectionalArrowLength={7}
+                        linkDirectionalArrowRelPos={1}
+                        linkCurvature={0.08}
+
+                        onNodeHover={(node) => {
+                          setHoveredNode(node || null);
+                        }}
+
+                        onLinkHover={(link) => {
+                          setHoveredLink(link || null);
+                        }}
+
+                        onNodeClick={(node) => {
+                          setSelectedCriminal(node);
+                        }}
+
+                        onLinkClick={(link) => {
+                          setSelectedRelationship(link);
+                        }}
+
                         onNodeDragEnd={(node) => {
                           node.fx = null;
                           node.fy = null;
                           graphRef.current?.d3ReheatSimulation?.();
                         }}
-                        onLinkClick={(link) => setSelectedRelationship(link)}
-                        onNodeClick={(node) => setSelectedCriminal((current) => current?.person_id === node.id ? current : current)}
-                        onEngineStop={() => graphRef.current?.zoomToFit?.(600, 100)}
+
+                        onEngineStop={() => {
+                          graphRef.current?.zoomToFit?.(800, 120);
+                        }}
                       />
                     )}
                     <div className="graph-help">Generated from current case evidence • Drag nodes • Scroll to zoom • Click a relationship for evidence details • Hover a node for profile information</div>
@@ -950,7 +1111,29 @@ export default function App() {
                 {selectedRelationship && (
                   <aside className="relationship-panel">
                     <div className="relationship-panel-head"><div><span className="eyebrow">RELATIONSHIP INTELLIGENCE</span><h3>Connection Details</h3></div><button onClick={() => setSelectedRelationship(null)}>×</button></div>
-                    <div className="relationship-subjects"><div><span>PERSON A</span><strong>{selectedRelationship.source}</strong></div><div className="relationship-arrow">↔</div><div><span>PERSON B</span><strong>{selectedRelationship.target}</strong></div></div>
+                    <div className="relationship-subjects">
+                      <div>
+                        <span>PERSON A</span>
+                        <strong>
+                          {graph.nodes.find((n) => n.id === (
+                            typeof selectedRelationship.source === "object"
+                              ? selectedRelationship.source.id
+                              : selectedRelationship.source
+                          ))?.name || selectedRelationship.source}
+                        </strong>
+                      </div>
+                      <div className="relationship-arrow">↔</div>
+                      <div>
+                        <span>PERSON B</span>
+                        <strong>
+                          {graph.nodes.find((n) => n.id === (
+                            typeof selectedRelationship.target === "object"
+                              ? selectedRelationship.target.id
+                              : selectedRelationship.target
+                          ))?.name || selectedRelationship.target}
+                        </strong>
+                      </div>
+                    </div>
                     <div className="relationship-type-block"><span>RELATIONSHIP TYPE</span><strong>{selectedRelationship.relationship_type || "Potential Relationship"}</strong><em>{selectedRelationship.confidence != null ? `${Math.round(selectedRelationship.confidence * 100)}% analytical confidence` : "Confidence unavailable"}</em></div>
                     <div className="relationship-metrics"><div><span>PHONE CALLS</span><strong>{selectedRelationship.calls || 0}</strong></div><div><span>TRANSACTIONS</span><strong>{selectedRelationship.transactions || 0}</strong></div><div><span>MEETINGS</span><strong>{selectedRelationship.meetings || 0}</strong></div><div><span>TRANSACTION VALUE</span><strong>₹{Number(selectedRelationship.total_transaction_amount || 0).toLocaleString("en-IN")}</strong></div></div>
                     <div className="relationship-evidence"><span>EVIDENCE EXPLANATION</span><p>{selectedRelationship.relationship_description || selectedRelationship.reason || "No explanation is available for this candidate link."}</p></div>

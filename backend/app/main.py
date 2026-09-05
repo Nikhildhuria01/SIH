@@ -8,9 +8,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 
@@ -19,15 +18,6 @@ def extract_entities(text: str):
     from .nlp import extract_entities as _extract_entities
 
     return _extract_entities(text)
-
-
-def nlp_model_loaded() -> bool:
-    try:
-        from .nlp import NLP_MODEL_LOADED
-
-        return NLP_MODEL_LOADED
-    except Exception:
-        return False
 
 
 from .security import hash_link, sha256_json, utc_now
@@ -45,22 +35,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.exception_handler(Exception)
-async def unhandled_exception_handler(request: Request, exc: Exception):
-    # Any exception raised below (e.g. a lower-level httpx/httpcore/network
-    # failure while calling Supabase) would otherwise crash the ASGI
-    # connection before CORSMiddleware can attach CORS headers, which shows
-    # up in the browser as a misleading "blocked by CORS policy" error
-    # instead of the real cause. Catching it here still goes through
-    # CORSMiddleware, so the frontend gets a normal, readable error.
-    print(f"Unhandled exception on {request.method} {request.url.path}:", exc)
-    return JSONResponse(
-        status_code=500,
-        content={"detail": f"Unexpected server error: {exc}"},
-    )
-
 
 ROOT = Path(__file__).resolve().parents[2]
 MODEL_DIR = ROOT / "ml"
@@ -439,6 +413,206 @@ def relationship_reason(record: Dict[str, Any]) -> str:
 # -----------------------------------------------------------------------------
 
 
+PERSON_FALSE_POSITIVE = {
+    "age",
+    "status",
+    "record",
+    "record 1",
+    "record 2",
+    "record 3",
+    "record 4",
+    "record 5",
+    "record 6",
+    "record 7",
+    "record 8",
+    "cyber crime",
+    "cyber crime unit",
+    "criminal history",
+    "criminal history database",
+    "police",
+    "police report",
+    "police reports",
+    "investigation",
+    "investigation report",
+    "investigators",
+    "investigator",
+    "financial fraud",
+    "fraud",
+    "fraud facilitation",
+    "to account",
+    "from account",
+    "to person",
+    "from person",
+    "caller",
+    "receiver",
+    "account",
+    "amount",
+    "date",
+    "time",
+    "location",
+    "vehicle",
+    "organization",
+    "company",
+    "profile",
+    "public profile",
+    "source",
+    "status",
+    "completed",
+    "under investigation",
+    "under review",
+    "none",
+}
+
+RELATIONSHIP_CUES = (
+    "met",
+    "meet",
+    "meeting",
+    "meetings",
+    "called",
+    "call",
+    "contacted",
+    "contact",
+    "communication",
+    "communicated",
+    "spoke",
+    "talked",
+    "messaged",
+    "message",
+    "interaction",
+    "interacted",
+    "together",
+    "partner",
+    "friend",
+    "family",
+    "brother",
+    "sister",
+    "father",
+    "mother",
+    "spouse",
+    "relative",
+    "colleague",
+    "associate",
+    "associated",
+    "transferred",
+    "transfer",
+    "transaction",
+    "paid",
+    "payment",
+    "sent",
+    "received",
+    "observed",
+    "seen",
+    "travelled",
+    "traveling",
+    "travelling",
+    "shared",
+    "linked",
+    "connected",
+    "arrived",
+    "departed",
+)
+
+
+def clean_person_name(value: str) -> str | None:
+    value = re.sub(r"\s+", " ", str(value or "")).strip(" ,.;:-")
+    if not value:
+        return None
+
+    normalized = normalize_text(value)
+
+    if normalized in PERSON_FALSE_POSITIVE:
+        return None
+
+    # A genuine person name in our investigation graph should contain at least
+    # two word-like tokens. This removes NER mistakes such as "K", "Status",
+    # "To Account", and organization/category labels.
+    tokens = value.split()
+
+    if len(tokens) < 2:
+        return None
+
+    if len(tokens) > 5:
+        return None
+
+    if any(char.isdigit() for char in value):
+        return None
+
+    if any(token.lower().rstrip(":,.;") in PERSON_FALSE_POSITIVE for token in tokens):
+        return None
+
+    if all(not re.search(r"[A-Za-zÀ-ÿ]", token) for token in tokens):
+        return None
+
+    # Don't accept strings that are obviously field/category descriptions.
+    category_words = {
+        "account",
+        "amount",
+        "status",
+        "crime",
+        "record",
+        "case",
+        "reference",
+        "date",
+        "time",
+        "duration",
+        "location",
+        "police",
+        "report",
+        "unit",
+        "database",
+        "profile",
+    }
+    if sum(token.lower().strip(":,.") in category_words for token in tokens) >= 1:
+        return None
+
+    return value
+
+
+def extract_valid_people(
+    extracted_people: list[str],
+) -> list[str]:
+    result = []
+    seen = set()
+
+    for person in extracted_people or []:
+        cleaned = clean_person_name(person)
+        if not cleaned:
+            continue
+
+        key = normalize_text(cleaned)
+        if key in seen:
+            continue
+
+        seen.add(key)
+        result.append(cleaned)
+
+    return result
+
+
+def extract_people_from_source_text(
+    text: str,
+    person_profiles: Dict[str, Dict[str, Any]],
+) -> list[str]:
+    """
+    Resolve only already-known people from this investigation. This is used
+    after entity extraction so the graph cannot accidentally promote arbitrary
+    entities into people.
+    """
+    found = []
+    for key, profile in person_profiles.items():
+        name = profile["name"]
+        if re.search(
+            rf"\b{re.escape(name)}\b",
+            text,
+            flags=re.I,
+        ):
+            found.append(key)
+    return sorted(
+        set(found),
+        key=lambda key: text.lower().find(person_profiles[key]["name"].lower()),
+    )
+
+
 def make_person_profile(
     name: str,
     sources: List[Dict[str, Any]],
@@ -457,53 +631,111 @@ def make_person_profile(
         "source_types": set(),
     }
 
+    def sentence_contexts(text: str) -> list[str]:
+        return [
+            item.strip()
+            for item in re.split(r"(?<=[.!?])\s+|\n+", text)
+            if item.strip()
+            and re.search(
+                rf"\b{re.escape(name)}\b",
+                item,
+                flags=re.I,
+            )
+        ]
+
     for source in sources:
         entities = source["entities"]
         text = source["content"]
-        profile["source_types"].add(source["source_type"].upper())
+        source_type = source["source_type"].upper()
+        profile["source_types"].add(source_type)
 
-        # Only assign a unique structured field when the source contains one
-        # person. This avoids attaching Rahul's phone to Amit just because both
-        # appear in the same FIR.
-        if len(entities.get("PERSON", [])) == 1:
-            phones = entities.get("PHONE", [])
-            vehicles = entities.get("VEHICLE", [])
-            orgs = entities.get("ORG", [])
-            locations = entities.get("GPE", [])
-            banks = entities.get("BANK", [])
-            if phones and not profile["phone_num"]:
-                profile["phone_num"] = clean_phone(phones[0])
-            if vehicles and not profile["vehicle_num"]:
-                profile["vehicle_num"] = vehicles[0]
-            if orgs and not profile["org"]:
-                profile["org"] = orgs[0]
-            if locations and not profile["location"]:
-                profile["location"] = locations[0]
-            if banks and not profile["bank_account"]:
-                profile["bank_account"] = banks[0]
+        for context in sentence_contexts(text):
+            if not profile["phone_num"]:
+                match = re.search(
+                    r"(?<!\d)((?:\+91[- ]?)?[6-9]\d{9})(?!\d)",
+                    context,
+                )
+                if match:
+                    profile["phone_num"] = clean_phone(match.group(1))
 
-        # Lightweight age/crime extraction when explicitly written near a name.
-        age_match = re.search(
-            rf"\b{re.escape(name)}\b[^.\n]{{0,80}}?\bage\s*[:=]?\s*(\d{{1,3}})",
-            text,
-            flags=re.I,
-        )
-        if age_match and not profile["age"]:
-            profile["age"] = int(age_match.group(1))
+            if not profile["vehicle_num"]:
+                match = re.search(
+                    r"\b((?:DL|HR|UP|PB)[- ]?\d{1,2}[- ]?[A-Z]{1,3}[- ]?\d{3,4})\b",
+                    context,
+                    flags=re.I,
+                )
+                if match:
+                    profile["vehicle_num"] = match.group(1)
 
-        if (
-            source["source_type"].upper() in {"CRIMINAL_HISTORY", "FIR"}
-            and not profile["crime_recorded"]
-        ):
-            crime_match = re.search(
-                rf"\b{re.escape(name)}\b[^.\n]{{0,180}}?(?:recorded\s+categories|crime|charges?|case\s+references?)\s*[:=]?\s*([^\.\n]+)",
+            if not profile["age"]:
+                match = re.search(
+                    r"\bage\s*[:=]?\s*(\d{1,3})",
+                    context,
+                    flags=re.I,
+                )
+                if match:
+                    profile["age"] = int(match.group(1))
+
+            if not profile["org"]:
+                match = re.search(
+                    r"(?:associated with|works at|works for|organization|company)\s*"
+                    r"[:=]?\s*([A-Z][A-Za-z&.'-]*(?:\s+[A-Z][A-Za-z&.'-]*){0,6})",
+                    context,
+                    flags=re.I,
+                )
+                if match:
+                    candidate = match.group(1).strip(" ,.;:")
+                    if len(candidate) > 2:
+                        profile["org"] = candidate
+
+            if not profile["location"]:
+                match = re.search(
+                    r"(?:near|at|in|from|location)\s*[:=]?\s*"
+                    r"([A-Z][A-Za-z0-9 ,.'-]{2,60})",
+                    context,
+                    flags=re.I,
+                )
+                if match:
+                    candidate = match.group(1).strip(" ,.;:")
+                    if len(candidate) > 2:
+                        profile["location"] = candidate
+
+            if not profile["bank_account"]:
+                match = re.search(
+                    r"\b(?:account|bank account)\s*[:=]?\s*"
+                    r"(X{2,}\d{2,}|(?:XX)?\d{6,18})\b",
+                    context,
+                    flags=re.I,
+                )
+                if match:
+                    profile["bank_account"] = match.group(1)
+
+        # Safe fallback if the source contains exactly one valid person.
+        valid_people = extract_valid_people(entities.get("PERSON", []))
+        if len(valid_people) == 1 and valid_people[0].lower() == name.lower():
+            if not profile["phone_num"] and entities.get("PHONE"):
+                profile["phone_num"] = clean_phone(entities["PHONE"][0])
+            if not profile["vehicle_num"] and entities.get("VEHICLE"):
+                profile["vehicle_num"] = entities["VEHICLE"][0]
+            if not profile["org"] and entities.get("ORG"):
+                profile["org"] = entities["ORG"][0]
+            if not profile["location"] and entities.get("GPE"):
+                profile["location"] = entities["GPE"][0]
+            if not profile["bank_account"] and entities.get("BANK"):
+                profile["bank_account"] = entities["BANK"][0]
+
+        if source_type in {"CRIMINAL_HISTORY", "FIR"} and not profile["crime_recorded"]:
+            match = re.search(
+                rf"\b{re.escape(name)}\b[^.\n]{{0,180}}?"
+                r"(?:recorded\s+categories|crime|charges?|case\s+references?)"
+                r"\s*[:=]?\s*([^\.\n]+)",
                 text,
                 flags=re.I,
             )
-            if crime_match:
-                profile["crime_recorded"] = crime_match.group(1).strip()
+            if match:
+                profile["crime_recorded"] = match.group(1).strip()
 
-        if source["source_type"].upper() == "FIR" and not profile["fir_language"]:
+        if source_type == "FIR" and not profile["fir_language"]:
             profile["fir_language"] = source.get("language", "en")
 
     return profile
@@ -517,6 +749,11 @@ def build_live_candidates(
     sources: List[Dict[str, Any]],
     person_profiles: Dict[str, Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
+    """
+    Build ONLY evidence-backed person-to-person relationships.
+
+    There is no all-to-all combination across a complete document.
+    """
     candidates: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
     def get_candidate(a: str, b: str) -> Dict[str, Any]:
@@ -540,110 +777,236 @@ def build_live_candidates(
             },
         )
 
+    def add_pair(
+        a_key: str,
+        b_key: str,
+        source_type: str,
+        calls: int = 0,
+        duration: int = 0,
+        transactions: int = 0,
+        amount: float = 0.0,
+        meetings: int = 0,
+    ):
+        if not a_key or not b_key or a_key == b_key:
+            return
+
+        record = get_candidate(a_key, b_key)
+        record["co_occurrences"] += 1
+        record["source_types"].add(source_type)
+        record["phone_call_count"] += calls
+        record["total_call_duration_sec"] += duration
+        record["transaction_count"] += transactions
+        record["total_transaction_amount"] += amount
+        record["meeting_count"] += meetings
+
+    # --------------------------------------------------------------
+    # Narrative sources: pair names ONLY when they are explicitly
+    # connected in the same sentence/record.
+    # --------------------------------------------------------------
+    narrative_sources = {
+        "FIR",
+        "POLICE_REPORT",
+        "SURVEILLANCE",
+        "SOCIAL_MEDIA",
+        "CRIMINAL_HISTORY",
+    }
+
     for source in sources:
-        entities = source["entities"]
-        people = [p for p in entities.get("PERSON", []) if normalize_text(p)]
-        if len(people) < 2:
-            continue
-
-        activity = source_activity(source["source_type"], source["content"])
         source_type = source["source_type"].upper()
+        content = source["content"]
 
-        phones = {clean_phone(v) for v in entities.get("PHONE", []) if clean_phone(v)}
-        vehicles = {normalize_text(v) for v in entities.get("VEHICLE", []) if v}
-        orgs = {normalize_text(v) for v in entities.get("ORG", []) if v}
-        locations = {normalize_text(v) for v in entities.get("GPE", []) if v}
-
-        for a_name, b_name in itertools.combinations(people, 2):
-            a_key = normalize_text(a_name)
-            b_key = normalize_text(b_name)
-            if a_key not in person_profiles or b_key not in person_profiles:
-                continue
-
-            record = get_candidate(a_key, b_key)
-            record["co_occurrences"] += 1
-            record["source_types"].add(source_type)
-            record["phone_call_count"] += int(activity["calls"])
-            record["total_call_duration_sec"] += int(activity["duration"])
-            record["transaction_count"] += int(activity["transactions"])
-            record["total_transaction_amount"] += float(activity["amount"])
-            record["meeting_count"] += int(activity["meetings"])
-
-            a_profile = person_profiles[a_key]
-            b_profile = person_profiles[b_key]
-            if a_profile.get("phone_num") and a_profile.get(
-                "phone_num"
-            ) == b_profile.get("phone_num"):
-                record["shared_phone"] = 1
-            if a_profile.get("vehicle_num") and normalize_text(
-                a_profile.get("vehicle_num")
-            ) == normalize_text(b_profile.get("vehicle_num")):
-                record["shared_vehicle"] = 1
-            if a_profile.get("org") and normalize_text(
-                a_profile.get("org")
-            ) == normalize_text(b_profile.get("org")):
-                record["shared_org"] = 1
-            if a_profile.get("location") and normalize_text(
-                a_profile.get("location")
-            ) == normalize_text(b_profile.get("location")):
-                record["shared_location"] = 1
-
-        # Source may have only structured identifiers rather than names.
-        # Map CDR caller/receiver phones and transaction account holders back
-        # to current-investigation people; this still uses ONLY the submitted
-        # source corpus, never the training dataset.
-        if source_type == "CDR":
-            known_people_by_phone = {
-                p["phone_num"]: key
-                for key, p in person_profiles.items()
-                if p.get("phone_num")
-            }
-            phones_in_text = [
-                clean_phone(x)
-                for x in re.findall(r"(?:\+91[- ]?)?[6-9]\d{9}", source["content"])
+        if source_type in narrative_sources:
+            records = [
+                item.strip()
+                for item in re.split(r"(?<=[.!?])\s+|\n+", content)
+                if item.strip()
             ]
-            mapped = list(
-                dict.fromkeys(
-                    [
-                        known_people_by_phone.get(p)
-                        for p in phones_in_text
-                        if known_people_by_phone.get(p)
-                    ]
-                )
-            )
-            if len(mapped) >= 2:
-                for a_key, b_key in itertools.combinations(mapped, 2):
-                    record = get_candidate(a_key, b_key)
-                    record["source_types"].add("CDR")
-                    record["phone_call_count"] += max(1, int(activity["calls"]))
-                    record["total_call_duration_sec"] += int(activity["duration"])
 
-        if source_type == "FINANCIAL":
-            # Use explicit From Person / To Person pairs where present.
-            transactions = re.split(
-                r"(?=Transaction\s+\d+)", source["content"], flags=re.I
-            )
+            for record_text in records:
+                mentioned = extract_people_from_source_text(
+                    record_text,
+                    person_profiles,
+                )
+
+                if len(mentioned) < 2:
+                    continue
+
+                # Only relationship-bearing records generate links.
+                lower = record_text.lower()
+                if not any(cue in lower for cue in RELATIONSHIP_CUES):
+                    continue
+
+                if len(mentioned) == 2:
+                    a_key, b_key = mentioned
+                    add_pair(
+                        a_key,
+                        b_key,
+                        source_type,
+                        meetings=(
+                            1
+                            if source_type == "SURVEILLANCE"
+                            and any(
+                                cue in lower
+                                for cue in (
+                                    "meet",
+                                    "meeting",
+                                    "observed",
+                                    "seen together",
+                                )
+                            )
+                            else 0
+                        ),
+                    )
+                else:
+                    # With >2 people in one sentence, do NOT make all pairs.
+                    # Link only the two people closest around the relationship
+                    # cue. This avoids N choose 2 explosions.
+                    cue_positions = [
+                        lower.find(cue)
+                        for cue in RELATIONSHIP_CUES
+                        if lower.find(cue) >= 0
+                    ]
+                    cue_pos = (
+                        min(cue_positions) if cue_positions else len(record_text) // 2
+                    )
+
+                    before = [
+                        key
+                        for key in mentioned
+                        if record_text.lower().find(
+                            person_profiles[key]["name"].lower()
+                        )
+                        < cue_pos
+                    ]
+                    after = [
+                        key
+                        for key in mentioned
+                        if record_text.lower().find(
+                            person_profiles[key]["name"].lower()
+                        )
+                        > cue_pos
+                    ]
+
+                    if before and after:
+                        add_pair(
+                            before[-1],
+                            after[0],
+                            source_type,
+                            meetings=(1 if source_type == "SURVEILLANCE" else 0),
+                        )
+
+        # ----------------------------------------------------------
+        # CDR: ONLY explicit caller -> receiver phone pair.
+        # ----------------------------------------------------------
+        elif source_type == "CDR":
+            people_by_phone = {
+                clean_phone(profile.get("phone_num")): key
+                for key, profile in person_profiles.items()
+                if profile.get("phone_num")
+            }
+
+            blocks = [
+                item.strip()
+                for item in re.split(
+                    r"(?=Record\s+\d+)",
+                    content,
+                    flags=re.I,
+                )
+                if item.strip()
+            ]
+
+            for block in blocks:
+                caller_match = re.search(
+                    r"Caller\s*:\s*((?:\+91[- ]?)?[6-9]\d{9})",
+                    block,
+                    flags=re.I,
+                )
+                receiver_match = re.search(
+                    r"Receiver\s*:\s*((?:\+91[- ]?)?[6-9]\d{9})",
+                    block,
+                    flags=re.I,
+                )
+
+                if not caller_match or not receiver_match:
+                    continue
+
+                caller = clean_phone(caller_match.group(1))
+                receiver = clean_phone(receiver_match.group(1))
+
+                a_key = people_by_phone.get(caller)
+                b_key = people_by_phone.get(receiver)
+
+                if not a_key or not b_key or a_key == b_key:
+                    continue
+
+                duration_match = re.search(
+                    r"Duration\s*:\s*(\d+)",
+                    block,
+                    flags=re.I,
+                )
+
+                add_pair(
+                    a_key,
+                    b_key,
+                    "CDR",
+                    calls=1,
+                    duration=(int(duration_match.group(1)) if duration_match else 0),
+                )
+
+        # ----------------------------------------------------------
+        # Financial: ONLY explicit From Person -> To Person.
+        # ----------------------------------------------------------
+        elif source_type == "FINANCIAL":
+            transactions = [
+                item.strip()
+                for item in re.split(
+                    r"(?=Transaction\s+\d+)",
+                    content,
+                    flags=re.I,
+                )
+                if item.strip()
+            ]
+
             for chunk in transactions:
-                from_match = re.search(r"From Person\s*:\s*([^\n]+)", chunk, flags=re.I)
-                to_match = re.search(r"To Person\s*:\s*([^\n]+)", chunk, flags=re.I)
+                from_match = re.search(
+                    r"From Person\s*:\s*([^\n]+)",
+                    chunk,
+                    flags=re.I,
+                )
+                to_match = re.search(
+                    r"To Person\s*:\s*([^\n]+)",
+                    chunk,
+                    flags=re.I,
+                )
                 amount_match = re.search(
                     r"Amount\s*:\s*(?:INR|Rs\.?|₹)?\s*([0-9,]+(?:\.\d+)?)",
                     chunk,
                     flags=re.I,
                 )
-                if from_match and to_match:
-                    a_key = normalize_text(from_match.group(1))
-                    b_key = normalize_text(to_match.group(1))
-                    if a_key in person_profiles and b_key in person_profiles:
-                        record = get_candidate(a_key, b_key)
-                        record["source_types"].add("FINANCIAL")
-                        record["transaction_count"] += 1
-                        if amount_match:
-                            record["total_transaction_amount"] += float(
-                                amount_match.group(1).replace(",", "")
-                            )
+
+                if not from_match or not to_match:
+                    continue
+
+                a_key = normalize_text(from_match.group(1))
+                b_key = normalize_text(to_match.group(1))
+
+                if a_key not in person_profiles or b_key not in person_profiles:
+                    continue
+
+                add_pair(
+                    a_key,
+                    b_key,
+                    "FINANCIAL",
+                    transactions=1,
+                    amount=(
+                        float(amount_match.group(1).replace(",", ""))
+                        if amount_match
+                        else 0.0
+                    ),
+                )
 
     results: List[Dict[str, Any]] = []
+
     for record in candidates.values():
         record["source_diversity"] = len(record.pop("source_types"))
         record["calls"] = record["phone_call_count"]
@@ -651,17 +1014,40 @@ def build_live_candidates(
         record["transactions"] = record["transaction_count"]
         record["amount"] = record["total_transaction_amount"]
         record["meetings"] = record["meeting_count"]
+
         record["model_confidence"] = predict_relationship(record)
         record["reason"] = relationship_reason(record)
-        record["relationship_type"] = "Potential Relationship"
+
+        calls = int(record.get("calls") or 0)
+        txns = int(record.get("transactions") or 0)
+        meetings = int(record.get("meetings") or 0)
+
+        if calls >= 3 and txns >= 1:
+            record["relationship_type"] = "Communication & Financial Association"
+        elif meetings >= 1 and txns >= 1:
+            record["relationship_type"] = "Meeting & Financial Association"
+        elif meetings >= 2:
+            record["relationship_type"] = "Repeated Meeting Association"
+        elif txns >= 1:
+            record["relationship_type"] = "Financial Association"
+        elif calls >= 1:
+            record["relationship_type"] = "Communication Association"
+        elif record.get("source_diversity", 0) >= 2:
+            record["relationship_type"] = "Multi-source Association"
+        else:
+            record["relationship_type"] = "Evidence-linked Association"
 
         anomaly = anomaly_result(record)
         record["suspicious"] = anomaly["is_anomaly"]
         record["anomaly_score"] = anomaly["anomaly_score"]
         record["suspicious_reasons"] = anomaly["reasons"]
+
         results.append(record)
 
-    results.sort(key=lambda item: item["model_confidence"], reverse=True)
+    results.sort(
+        key=lambda item: item["model_confidence"],
+        reverse=True,
+    )
     return results
 
 
@@ -670,8 +1056,12 @@ def build_live_graph(
     person_profiles: Dict[str, Dict[str, Any]],
     candidates: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    # Every node ID is assigned from the current investigation only.
-    key_to_id: Dict[str, str] = {}
+
+    connected_keys = set()
+
+    for record in candidates:
+        connected_keys.add(record["person_a_key"])
+        connected_keys.add(record["person_b_key"])
 
     investigation_prefix = re.sub(
         r"[^A-Za-z0-9]",
@@ -679,15 +1069,22 @@ def build_live_graph(
         investigation_id,
     )[:12].upper()
 
-    for index, key in enumerate(sorted(person_profiles), start=1):
+    key_to_id: Dict[str, str] = {}
+
+    for index, key in enumerate(
+        sorted(connected_keys),
+        start=1,
+    ):
         key_to_id[key] = f"LIVE-{investigation_prefix}-{index:04d}"
 
-    nodes: List[Dict[str, Any]] = []
-    for key, profile in person_profiles.items():
-        person_id = key_to_id[key]
+    nodes = []
+
+    for key in sorted(connected_keys):
+        profile = person_profiles[key]
+
         nodes.append(
             {
-                "id": person_id,
+                "id": key_to_id[key],
                 "name": profile["name"],
                 "type": "PERSON",
                 "is_center": False,
@@ -703,10 +1100,12 @@ def build_live_graph(
             }
         )
 
-    links: List[Dict[str, Any]] = []
+    links = []
+
     for record in candidates:
         source = key_to_id.get(record["person_a_key"])
         target = key_to_id.get(record["person_b_key"])
+
         if not source or not target:
             continue
 
@@ -716,8 +1115,9 @@ def build_live_graph(
                 "target": target,
                 "relationship_type": record["relationship_type"],
                 "relationship_description": (
-                    f"{record['reason']} This is an analytical lead generated "
-                    "from the evidence supplied for this investigation."
+                    f"{record['reason']} This is an analytical lead "
+                    "generated only from evidence supplied for this "
+                    "investigation."
                 ),
                 "confidence": record["model_confidence"],
                 "reason": record["reason"],
@@ -732,7 +1132,10 @@ def build_live_graph(
             }
         )
 
-    return {"nodes": nodes, "links": links}
+    return {
+        "nodes": nodes,
+        "links": links,
+    }
 
 
 def live_graph_analytics(graph_data: Dict[str, Any]) -> Dict[str, Any]:
@@ -796,17 +1199,24 @@ def persist_people(
     graph_data: Dict[str, Any],
     source_documents: List[Dict[str, Any]],
 ) -> None:
+    """
+    Persist only people generated from the current investigation's submitted
+    evidence. source_type is stored inside each item's document object.
+    """
     if supabase is None:
         return
 
-    # Build one source-document ID per person where possible.
-    document_ids = {
-        doc["source_type"]: doc["document"]["id"]
-        for doc in source_documents
-        if doc.get("document")
-    }
+    document_ids: Dict[str, str] = {}
 
-    for node in graph_data["nodes"]:
+    for item in source_documents:
+        document = item.get("document") or {}
+        source_type = document.get("source_type")
+        document_id = document.get("id")
+
+        if source_type and document_id:
+            document_ids[source_type] = document_id
+
+    for node in graph_data.get("nodes", []):
         payload = {
             "person_id": node["id"],
             "investigation_id": investigation_id,
@@ -817,71 +1227,118 @@ def persist_people(
             "vehicle_num": node.get("vehicle_num"),
             "org": node.get("org"),
             "bank_account": node.get("bank_account"),
-            "crime_recorded": node.get("crime_recorded") or "Source-linked subject",
+            "crime_recorded": (node.get("crime_recorded") or "Source-linked subject"),
             "fir_language": node.get("fir_language"),
             "source_document_id": document_ids.get("FIR"),
         }
-        payload = {k: v for k, v in payload.items() if v is not None}
 
-        existing = (
-            supabase.table("persons")
-            .select("id")
-            .eq("investigation_id", investigation_id)
-            .eq("person_id", node["id"])
-            .limit(1)
-            .execute()
-        )
-        if existing.data:
-            supabase.table("persons").update(payload).eq(
-                "id", existing.data[0]["id"]
-            ).execute()
-        else:
-            supabase.table("persons").insert(payload).execute()
+        payload = {key: value for key, value in payload.items() if value is not None}
+
+        try:
+            existing = (
+                supabase.table("persons")
+                .select("id")
+                .eq("investigation_id", investigation_id)
+                .eq("person_id", node["id"])
+                .limit(1)
+                .execute()
+            )
+
+            if existing.data:
+                (
+                    supabase.table("persons")
+                    .update(payload)
+                    .eq("id", existing.data[0]["id"])
+                    .execute()
+                )
+            else:
+                supabase.table("persons").insert(payload).execute()
+
+        except Exception as exc:
+            print(
+                f"Person persistence failed for "
+                f"{node.get('name', 'Unknown')}: {exc}"
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Unable to save extracted person "
+                    f"{node.get('name', 'Unknown')}: {exc}"
+                ),
+            )
 
 
 def persist_relationships(
     investigation_id: str,
     graph_data: Dict[str, Any],
 ) -> None:
+    """
+    Persist generated relationships for this investigation only.
+    Retries without optional anomaly fields for an older schema.
+    """
     if supabase is None:
         return
 
     try:
-        supabase.table("person_relationships").delete().eq(
-            "investigation_id", investigation_id
-        ).execute()
+        (
+            supabase.table("person_relationships")
+            .delete()
+            .eq("investigation_id", investigation_id)
+            .execute()
+        )
     except Exception as exc:
-        print("Relationship cleanup failed:", exc)
         raise HTTPException(
             status_code=500,
             detail=f"Unable to reset investigation relationships: {exc}",
         )
 
-    node_names = {node["id"]: node["name"] for node in graph_data["nodes"]}
+    node_names = {node["id"]: node["name"] for node in graph_data.get("nodes", [])}
 
-    for index, link in enumerate(graph_data["links"], start=1):
+    investigation_token = re.sub(
+        r"[^A-Za-z0-9]",
+        "",
+        investigation_id,
+    )[:12].upper()
+
+    for index, link in enumerate(
+        graph_data.get("links", []),
+        start=1,
+    ):
         payload = {
-            "relationship_id": (
-                f"LIVE-{re.sub(r'[^A-Za-z0-9]', '', investigation_id)[:12]}-"
-                f"{index:04d}"
-            ),
+            "relationship_id": f"LIVE-{investigation_token}-{index:04d}",
             "investigation_id": investigation_id,
             "person_a_id": link["source"],
-            "person_a_name": node_names.get(link["source"], link["source"]),
-            "person_b_id": link["target"],
-            "person_b_name": node_names.get(link["target"], link["target"]),
-            "phone_call_count": link.get("calls", 0),
-            "total_call_duration_sec": link.get("total_call_duration_sec", 0),
-            "transaction_count": link.get("transactions", 0),
-            "total_transaction_amount": link.get("total_transaction_amount", 0),
-            "meeting_count": link.get("meetings", 0),
-            "relationship_label": (
-                1 if float(link.get("confidence") or 0) >= 0.5 else 0
+            "person_a_name": node_names.get(
+                link["source"],
+                link["source"],
             ),
+            "person_b_id": link["target"],
+            "person_b_name": node_names.get(
+                link["target"],
+                link["target"],
+            ),
+            "phone_call_count": link.get("calls", 0),
+            "total_call_duration_sec": link.get(
+                "total_call_duration_sec",
+                0,
+            ),
+            "transaction_count": link.get(
+                "transactions",
+                0,
+            ),
+            "total_transaction_amount": link.get(
+                "total_transaction_amount",
+                0,
+            ),
+            "meeting_count": link.get(
+                "meetings",
+                0,
+            ),
+            "relationship_label": 1,
             "ground_truth_confidence": None,
             "model_confidence": link.get("confidence"),
             "relationship_type": (
-                link.get("relationship_type") or "Potential Relationship"
+                link.get("relationship_type") or "Evidence-linked Association"
             ),
             "relationship_description": link.get("relationship_description"),
             "reason": link.get("reason"),
@@ -890,20 +1347,20 @@ def persist_relationships(
         }
 
         try:
-            supabase.table("person_relationships").insert(payload).execute()
+            (supabase.table("person_relationships").insert(payload).execute())
         except Exception as first_error:
             error_text = str(first_error).lower()
-            optional_schema_error = (
-                "suspicious" in error_text or "anomaly_score" in error_text
-            ) and ("column" in error_text or "schema cache" in error_text)
 
-            if not optional_schema_error:
+            missing_optional_column = (
+                "suspicious" in error_text
+                or "anomaly_score" in error_text
+                or ("column" in error_text and "does not exist" in error_text)
+            )
+
+            if not missing_optional_column:
                 raise HTTPException(
                     status_code=500,
-                    detail=(
-                        "Unable to save a generated relationship to Supabase. "
-                        f"{first_error}"
-                    ),
+                    detail=("Unable to save generated relationship: " f"{first_error}"),
                 )
 
             legacy_payload = dict(payload)
@@ -911,17 +1368,18 @@ def persist_relationships(
             legacy_payload.pop("anomaly_score", None)
 
             try:
-                supabase.table("person_relationships").insert(legacy_payload).execute()
-                print(
-                    "Saved relationship without optional anomaly columns; "
-                    "update Supabase schema to persist those fields."
+                (
+                    supabase.table("person_relationships")
+                    .insert(legacy_payload)
+                    .execute()
                 )
             except Exception as second_error:
                 raise HTTPException(
                     status_code=500,
                     detail=(
-                        "Unable to save a generated relationship to Supabase. "
-                        f"Initial error: {first_error}; Retry error: {second_error}"
+                        "Unable to save generated relationship. "
+                        f"Initial error: {first_error}; "
+                        f"Retry error: {second_error}"
                     ),
                 )
 
@@ -938,7 +1396,6 @@ def health():
         "supabase_configured": supabase is not None,
         "relationship_model_loaded": RELATIONSHIP_MODEL is not None,
         "anomaly_model_loaded": ANOMALY_MODEL is not None,
-        "nlp_model_loaded": nlp_model_loaded(),
         "model_loading": "lazy_on_first_analysis",
         "analysis_mode": "live-submitted-evidence",
     }
@@ -1048,13 +1505,7 @@ def analyze_sources(
                 "document_id": document["id"] if document else None,
             }
         )
-        persisted_documents.append(
-            {
-                "document": document,
-                "entities": entities,
-                "source_type": source.source_type.upper(),
-            }
-        )
+        persisted_documents.append({"document": document, "entities": entities})
 
     if not context_documents:
         raise HTTPException(
@@ -1069,28 +1520,6 @@ def analyze_sources(
     candidates = build_live_candidates(context_documents, person_profiles)
     graph_data = build_live_graph(investigation_id, person_profiles, candidates)
     analytics = live_graph_analytics(graph_data)
-
-    warnings: List[str] = []
-    if not person_profiles:
-        warnings.append(
-            "No person names could be identified in the submitted evidence, "
-            "so no relationships, network graph, or suspicious-pattern "
-            "signals were generated. Try including full names in the "
-            "source text."
-        )
-    elif len(person_profiles) == 1:
-        warnings.append(
-            "Only one person was identified across the submitted evidence, "
-            "so no candidate relationships could be generated yet. Add "
-            "evidence that mentions at least two people together."
-        )
-    if not nlp_model_loaded():
-        warnings.append(
-            "The spaCy English NLP model is not installed on the server, "
-            "so entity extraction is running in a reduced-accuracy fallback "
-            "mode. Run 'python -m spacy download en_core_web_sm' in the "
-            "backend virtualenv and restart the API for full accuracy."
-        )
 
     suspicious_patterns = [
         {
@@ -1201,7 +1630,6 @@ def analyze_sources(
         "influential_persons": analytics.get("influential_persons", []),
         "community_count": analytics.get("community_count", 0),
         "graph": graph_data,
-        "warnings": warnings,
         "message": "Analysis completed from submitted investigation evidence only. Scores are analytical leads, not proof of criminality.",
     }
 
