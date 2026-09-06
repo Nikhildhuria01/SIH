@@ -1513,3 +1513,46 @@ textarea {
     grid-template-columns: 1fr;
   }
 }
+
+/* Persistent source editing */
+.source-edit-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 10px 0 8px;
+}
+
+.source-status {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: rgba(210, 230, 255, 0.45);
+}
+
+.source-status.has-content {
+  color: rgba(91, 235, 161, 0.78);
+}
+
+.source-edit-button {
+  flex: 0 0 auto;
+}
+
+.source-card textarea[readonly] {
+  opacity: 0.88;
+  cursor: default;
+}
+
+.source-card textarea:not([readonly]) {
+  border-color: rgba(74, 165, 255, 0.55);
+  box-shadow: 0 0 0 2px rgba(74, 165, 255, 0.08);
+}
+
+.analysis-stale {
+  color: #ffb56d;
+  margin-left: 4px;
+}
+
+.source-actions > span {
+  line-height: 1.6;
+}

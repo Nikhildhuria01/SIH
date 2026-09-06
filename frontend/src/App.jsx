@@ -37,6 +37,24 @@ function escapeHtml(value = "") {
     .replaceAll("'", "&#039;");
 }
 
+async function hashSourceDrafts(drafts = EMPTY_SOURCE, firLanguage = "en") {
+  const payload = SOURCE_TYPES
+    .map((source) => ({
+      source_type: source.key,
+      title: source.label,
+      content: drafts[source.key] || "",
+      language: source.key === "FIR" ? firLanguage : "en",
+    }))
+    .sort((a, b) => a.source_type.localeCompare(b.source_type));
+
+  const bytes = new TextEncoder().encode(JSON.stringify(payload));
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
 async function apiFetch(path, options = {}, session) {
   const response = await fetch(`${API}${path}`, {
     ...options,
@@ -59,7 +77,14 @@ async function apiFetch(path, options = {}, session) {
   }
 
   if (!response.ok) {
-    throw new Error(data?.detail || `Request failed with HTTP ${response.status}`);
+    const detail =
+      typeof data?.detail === "string"
+        ? data.detail
+        : JSON.stringify(data?.detail || data);
+
+    throw new Error(
+      `HTTP ${response.status}: ${detail}`
+    );
   }
   return data;
 }
@@ -111,6 +136,8 @@ export default function App() {
   const [selectedRelationship, setSelectedRelationship] = useState(null);
   const [hoveredNode, setHoveredNode] = useState(null);
   const [hoveredLink, setHoveredLink] = useState(null);
+  const [editingSources, setEditingSources] = useState({});
+  const [analysisStale, setAnalysisStale] = useState(false);
   const graphRef = useRef(null);
   const sourceSaveTimerRef = useRef(null);
   const restoringCaseRef = useRef(false);
@@ -318,6 +345,8 @@ export default function App() {
       setAnalysis(result);
       setAnalysisGraph(result.graph || { nodes: [], links: [] });
       setGraph(result.graph || { nodes: [], links: [] });
+      setAnalysisStale(false);
+      setEditingSources({});
       await loadInvestigations();
     } catch (err) {
       setError(err.message || "Unable to start investigation.");
@@ -352,6 +381,8 @@ export default function App() {
       setAnalysis(result);
       setAnalysisGraph(result.graph || { nodes: [], links: [] });
       setGraph(result.graph || { nodes: [], links: [] });
+      setAnalysisStale(false);
+      setEditingSources({});
       await loadInvestigations();
     } catch (err) {
       setError(err.message || "Source analysis failed.");
@@ -506,11 +537,19 @@ export default function App() {
         const drafts = { ...EMPTY_SOURCE };
         let firLanguage = "en";
 
-        (sourceResult?.sources || []).forEach((source) => {
-          if (Object.prototype.hasOwnProperty.call(drafts, source.source_type)) {
-            drafts[source.source_type] = source.content || "";
+        // The API may return either { sources: [...] } or the raw array.
+        // Support both so every saved intelligence record is restored after
+        // logout/login and becomes editable again.
+        const persistedSources = Array.isArray(sourceResult)
+          ? sourceResult
+          : (sourceResult?.sources || []);
+
+        persistedSources.forEach((source) => {
+          const sourceType = String(source?.source_type || "").trim().toUpperCase();
+          if (Object.prototype.hasOwnProperty.call(drafts, sourceType)) {
+            drafts[sourceType] = source?.content || "";
           }
-          if (source.source_type === "FIR" && source.language) {
+          if (sourceType === "FIR" && source?.language) {
             firLanguage = source.language;
           }
         });
@@ -531,6 +570,22 @@ export default function App() {
             ? analysisResult
             : null
         );
+
+        const savedHash = analysisResult?.source_snapshot_hash;
+        const currentHash = await hashSourceDrafts(
+          drafts,
+          firLanguage
+        );
+
+        setAnalysisStale(
+          Boolean(
+            savedHash &&
+            currentHash &&
+            savedHash !== currentHash
+          )
+        );
+
+        setEditingSources({});
         setSourceSaveStatus("Saved");
       } catch (err) {
         if (!cancelled) {
@@ -827,14 +882,59 @@ export default function App() {
                       <span className="source-icon">{source.icon}</span>
                       <div><strong>{source.label}</strong><small>{source.hint}</small></div>
                     </div>
+                    <div className="source-edit-row">
+                      <span className={`source-status ${sourceDrafts[source.key]?.trim() ? "has-content" : ""}`}>
+                        {sourceDrafts[source.key]?.trim()
+                          ? "Saved to case"
+                          : "No record added"}
+                      </span>
+
+                      <button
+                        type="button"
+                        className="ghost-button small source-edit-button"
+                        onClick={() =>
+                          setEditingSources((prev) => ({
+                            ...prev,
+                            [source.key]: !prev[source.key],
+                          }))
+                        }
+                      >
+                        {editingSources[source.key] ? "Done" : "Edit"}
+                      </button>
+                    </div>
+
                     <textarea
                       rows={5}
                       placeholder={`Paste ${source.label.toLowerCase()} here…`}
                       value={sourceDrafts[source.key]}
-                      onChange={(e) => setSourceDrafts((prev) => ({ ...prev, [source.key]: e.target.value }))}
+                      readOnly={!editingSources[source.key]}
+                      onChange={(e) => {
+                        setAnalysisStale(true);
+                        setSourceDrafts((prev) => ({
+                          ...prev,
+                          [source.key]: e.target.value,
+                        }));
+                      }}
+                      onBlur={() => {
+                        if (selected?.id) {
+                          saveSourcesForInvestigation(
+                            selected.id,
+                            sourceDrafts,
+                            sourceLanguage
+                          ).catch(() => {});
+                        }
+                      }}
                     />
+
                     {source.key === "FIR" && (
-                      <select value={sourceLanguage} onChange={(e) => setSourceLanguage(e.target.value)}>
+                      <select
+                        value={sourceLanguage}
+                        disabled={!editingSources.FIR}
+                        onChange={(e) => {
+                          setAnalysisStale(true);
+                          setSourceLanguage(e.target.value);
+                        }}
+                      >
                         <option value="en">FIR language: English</option>
                         <option value="hi">FIR language: Hindi</option>
                         <option value="pa">FIR language: Punjabi</option>
@@ -848,7 +948,16 @@ export default function App() {
                 <button className="primary-button" onClick={analyzeSourcesForExistingCase} disabled={analysisLoading}>
                   {analysisLoading ? "Running Intelligence Analysis…" : "Run Intelligence Analysis"}
                 </button>
-                <span>{sourceSaveStatus} · At least one source is required. Add only the sources available for the case.</span>
+                <span>
+                  {sourceSaveStatus} · At least one source is required.
+                  Add only the sources available for the case.
+                  {analysisStale && (
+                    <strong className="analysis-stale">
+                      {" "}Evidence changed — run analysis again to refresh
+                      the graph and analytics.
+                    </strong>
+                  )}
+                </span>
               </div>
             </section>
 
@@ -969,27 +1078,24 @@ export default function App() {
                         graphData={graph}
                         backgroundColor="#06101f"
                         enableNodeDrag
-                        cooldownTicks={420}
-                        warmupTicks={120}
-                        d3AlphaDecay={0.009}
-                        d3VelocityDecay={0.18}
-                        nodeAutoColorBy="is_center"
+                        cooldownTicks={360}
+                        warmupTicks={100}
+                        d3AlphaDecay={0.012}
+                        d3VelocityDecay={0.2}
                         nodeRelSize={7}
 
-                        // Node hover uses the library's cursor-following tooltip.
-                        // No fixed-position detail card is used.
+                        // ONLY PEOPLE are rendered as graph nodes.
+                        // The full name is the node label; all other person
+                        // attributes stay inside the hover tooltip.
                         nodeLabel={(node) => `
                           <div class="node-tooltip">
                             <div class="node-tooltip-head">
-                              <div class="node-tooltip-avatar">
-                                ${escapeHtml(initials(node.name))}
-                              </div>
+                              <div class="node-tooltip-avatar">${escapeHtml(initials(node.name))}</div>
                               <div>
                                 <strong>${escapeHtml(node.name || "Unknown")}</strong>
-                                <span>Person</span>
+                                <span>PERSON</span>
                               </div>
                             </div>
-
                             <div class="node-tooltip-grid">
                               <div><span>AGE</span><b>${escapeHtml(node.age ?? "—")}</b></div>
                               <div><span>LOCATION</span><b>${escapeHtml(node.location || "—")}</b></div>
@@ -1002,45 +1108,22 @@ export default function App() {
                           </div>
                         `}
 
-                        // Relationship hover also follows the cursor.
+                        // Relationship hover shows the connection type, why the
+                        // people are connected, evidence counts and confidence.
                         linkLabel={(link) => `
                           <div class="edge-tooltip">
-                            <strong>
-                              ${escapeHtml(
-                                link.relationship_type ||
-                                "Evidence-linked Association"
-                              )}
-                            </strong>
-                            ${
-                              link.confidence != null
-                                ? `<span>Potential score: ${Math.round(
-                                    link.confidence * 100
-                                  )}%</span>`
-                                : ""
-                            }
-                            <p>
-                              ${escapeHtml(
-                                link.relationship_description ||
-                                link.reason ||
-                                "Evidence-backed relationship."
-                              )}
-                            </p>
+                            <strong>${escapeHtml(link.relationship_type || "Evidence-linked Association")}</strong>
+                            <span class="edge-confidence">
+                              Potential relationship confidence:
+                              ${link.confidence != null
+                                ? `${Math.round(Number(link.confidence) * 100)}%`
+                                : "N/A"}
+                            </span>
+                            <p>${escapeHtml(link.reason || link.relationship_description || "Evidence-backed relationship.")}</p>
                             <div class="edge-evidence">
-                              ${
-                                Number(link.calls || 0) > 0
-                                  ? `<span>☎ ${Number(link.calls)} call(s)</span>`
-                                  : ""
-                              }
-                              ${
-                                Number(link.transactions || 0) > 0
-                                  ? `<span>₹ ${Number(link.transactions)} transaction(s)</span>`
-                                  : ""
-                              }
-                              ${
-                                Number(link.meetings || 0) > 0
-                                  ? `<span>● ${Number(link.meetings)} meeting(s)</span>`
-                                  : ""
-                              }
+                              ${Number(link.calls || 0) > 0 ? `<span>☎ ${Number(link.calls)} call(s)</span>` : ""}
+                              ${Number(link.transactions || 0) > 0 ? `<span>₹ ${Number(link.transactions)} transaction(s)</span>` : ""}
+                              ${Number(link.meetings || 0) > 0 ? `<span>● ${Number(link.meetings)} meeting(s)</span>` : ""}
                             </div>
                           </div>
                         `}
@@ -1048,20 +1131,13 @@ export default function App() {
                         nodeCanvasObject={(node, ctx, globalScale) => {
                           const isHovered = hoveredNode === node;
                           const isCenter = Boolean(node.is_center);
-
-                          const radius = isHovered ? 17 : 13;
+                          const radius = isHovered || isCenter ? 16 : 12;
 
                           ctx.save();
 
                           if (isHovered || isCenter) {
                             ctx.beginPath();
-                            ctx.arc(
-                              node.x,
-                              node.y,
-                              radius + 8,
-                              0,
-                              Math.PI * 2
-                            );
+                            ctx.arc(node.x, node.y, radius + 8, 0, Math.PI * 2);
                             ctx.fillStyle = isCenter
                               ? "rgba(46, 232, 137, 0.14)"
                               : "rgba(74, 165, 255, 0.12)";
@@ -1069,64 +1145,38 @@ export default function App() {
                           }
 
                           ctx.beginPath();
-                          ctx.arc(
-                            node.x,
-                            node.y,
-                            radius,
-                            0,
-                            Math.PI * 2
-                          );
-                          ctx.fillStyle = isCenter
-                            ? "#073a2d"
-                            : "#102944";
+                          ctx.arc(node.x, node.y, radius, 0, Math.PI * 2);
+                          ctx.fillStyle = isCenter ? "#073a2d" : "#102944";
                           ctx.fill();
-
                           ctx.strokeStyle = isCenter
                             ? "#2ee889"
                             : isHovered
-                              ? "#b7dcff"
+                              ? "#b9ddff"
                               : "#4aa5ff";
                           ctx.lineWidth = isHovered ? 3 : 2;
                           ctx.stroke();
 
-                          // Initials inside the person node.
-                          ctx.font =
-                            "700 11px Inter, system-ui, sans-serif";
+                          ctx.font = "700 11px Inter, system-ui, sans-serif";
                           ctx.fillStyle = "#f5f9ff";
                           ctx.textAlign = "center";
                           ctx.textBaseline = "middle";
-                          ctx.fillText(
-                            initials(node.name),
-                            node.x,
-                            node.y
-                          );
+                          ctx.fillText(initials(node.name), node.x, node.y);
 
-                          // Full PERSON NAME below the node.
-                          // No IDs, relationship types, locations, or other
-                          // entities are rendered on the graph itself.
+                          // Keep names readable but compact. No IDs or entity
+                          // metadata are painted onto the graph.
                           const name = node.name || "Unknown";
                           const nameSize = Math.max(
                             10,
-                            Math.min(
-                              14,
-                              12 / Math.max(globalScale, 0.75)
-                            )
+                            Math.min(13, 12 / Math.max(globalScale, 0.8))
                           );
+                          ctx.font = `600 ${nameSize}px Inter, system-ui, sans-serif`;
 
-                          ctx.font =
-                            `600 ${nameSize}px Inter, system-ui, sans-serif`;
-
-                          const textWidth =
-                            ctx.measureText(name).width;
-
+                          const textWidth = ctx.measureText(name).width;
                           const pillWidth = textWidth + 14;
                           const pillHeight = nameSize + 10;
-                          const pillY =
-                            node.y + radius + 7;
+                          const pillY = node.y + radius + 7;
 
-                          ctx.fillStyle =
-                            "rgba(4, 13, 25, 0.86)";
-
+                          ctx.fillStyle = "rgba(4, 13, 25, 0.88)";
                           ctx.beginPath();
                           ctx.roundRect(
                             node.x - pillWidth / 2,
@@ -1138,52 +1188,76 @@ export default function App() {
                           ctx.fill();
 
                           ctx.fillStyle = "#eef6ff";
-                          ctx.textAlign = "center";
                           ctx.textBaseline = "middle";
-
-                          ctx.fillText(
-                            name,
-                            node.x,
-                            pillY + pillHeight / 2
-                          );
+                          ctx.fillText(name, node.x, pillY + pillHeight / 2);
 
                           ctx.restore();
                         }}
 
+                        // Keep the graph clean: no permanent relationship prose.
+                        // Confidence is always visible as a compact badge on the
+                        // relationship itself, while full evidence appears on hover.
+                        linkCanvasObjectMode={() => "after"}
+                        linkCanvasObject={(link, ctx, globalScale) => {
+                          const source = link.source;
+                          const target = link.target;
+                          if (!source || !target) return;
+                          if (typeof source.x !== "number" || typeof target.x !== "number") return;
+
+                          const confidence = link.confidence != null
+                            ? `${Math.round(Number(link.confidence) * 100)}%`
+                            : "—";
+
+                          const x = (source.x + target.x) / 2;
+                          const y = (source.y + target.y) / 2;
+                          const fontSize = Math.max(9, Math.min(12, 10 / Math.max(globalScale, 0.8)));
+
+                          ctx.save();
+                          ctx.font = `700 ${fontSize}px Inter, system-ui, sans-serif`;
+                          const label = confidence;
+                          const width = ctx.measureText(label).width + 14;
+                          const height = fontSize + 9;
+
+                          ctx.fillStyle = hoveredLink === link
+                            ? "rgba(10, 35, 60, 0.98)"
+                            : "rgba(4, 13, 25, 0.88)";
+                          ctx.strokeStyle = hoveredLink === link
+                            ? "rgba(113, 186, 255, 0.85)"
+                            : "rgba(99, 179, 255, 0.38)";
+                          ctx.lineWidth = hoveredLink === link ? 1.5 : 1;
+
+                          ctx.beginPath();
+                          ctx.roundRect(
+                            x - width / 2,
+                            y - height / 2,
+                            width,
+                            height,
+                            5
+                          );
+                          ctx.fill();
+                          ctx.stroke();
+
+                          ctx.fillStyle = "#dff0ff";
+                          ctx.textAlign = "center";
+                          ctx.textBaseline = "middle";
+                          ctx.fillText(label, x, y);
+                          ctx.restore();
+                        }}
+
                         linkWidth={(link) =>
-                          hoveredLink === link
-                            ? 3.5
-                            : Math.max(
-                                1.5,
-                                1 + Number(link.confidence || 0)
-                              )
+                          hoveredLink === link ? 3.5 : 1.6
                         }
-
                         linkColor={(link) =>
-                          hoveredLink === link
-                            ? "#71baff"
-                            : "rgba(65, 155, 235, 0.48)"
+                          hoveredLink === link ? "#71baff" : "rgba(65, 155, 235, 0.52)"
                         }
-
                         linkDirectionalArrowLength={7}
                         linkDirectionalArrowRelPos={1}
                         linkCurvature={0.08}
 
-                        onNodeHover={(node) => {
-                          setHoveredNode(node || null);
-                        }}
-
-                        onLinkHover={(link) => {
-                          setHoveredLink(link || null);
-                        }}
-
-                        onNodeClick={(node) => {
-                          setSelectedCriminal(node);
-                        }}
-
-                        onLinkClick={(link) => {
-                          setSelectedRelationship(link);
-                        }}
+                        onNodeHover={(node) => setHoveredNode(node || null)}
+                        onLinkHover={(link) => setHoveredLink(link || null)}
+                        onNodeClick={(node) => setSelectedCriminal(node)}
+                        onLinkClick={(link) => setSelectedRelationship(link)}
 
                         onNodeDragEnd={(node) => {
                           node.fx = null;
@@ -1192,7 +1266,7 @@ export default function App() {
                         }}
 
                         onEngineStop={() => {
-                          graphRef.current?.zoomToFit?.(800, 120);
+                          graphRef.current?.zoomToFit?.(700, 110);
                         }}
                       />
                     )}
